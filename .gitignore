@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.design-qa/
+.DS_Store
+contracts/cache/
+contracts/out/
+contracts/broadcast/
+*.log
