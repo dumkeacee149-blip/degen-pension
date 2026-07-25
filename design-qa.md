@@ -2,44 +2,60 @@
 
 ## Evidence
 
-- Selected visual source: `design-sources/western-deadpan-selected.png` (1487 × 1058).
-- Desktop implementation: `qa/home-1440-final-v2.png` (1440 × 1024 viewport and document).
-- Normalized source: `qa/source-1440.png` (1440 × 1024).
-- Full side-by-side: `qa/comparison-1440.png`.
-- Focused buy-panel comparison: `qa/comparison-panel.png`.
-- Mobile implementation: `qa/home-mobile-390-v6.png` (390 × 844 viewport and document).
-- Formula page: `qa/proof-1440-viewport-v2.png`; route `/proof`.
-- Validated state: pre-launch, with no verified CA/Gateway configured and no fabricated member count.
+- Source visual truth: `design-sources/western-deadpan-selected.png` (1487 × 1058).
+- Normalized source: `audit-revision/source-1440.png` (1440 × 1024).
+- Initial implementation evidence: `audit-revision/01-current-1440.png` (1440 × 1024).
+- Final desktop implementation: `audit-revision/07-final-1440.png` (1440 × 1024 CSS viewport, DPR 1).
+- Final mobile implementation: `audit-revision/08-final-mobile-390.png` (390 × 844 CSS viewport, DPR 1).
+- Full final comparison: `audit-revision/compare-final.png`.
+- Focused panel comparison: `audit-revision/compare-panel-final.png`.
+- Live-route amount-dialog evidence: `audit-revision/05-live-buy-dialog.png` and `audit-revision/06-live-buy-dialog-mobile.png`.
+- Compared state: pre-launch, no verified CA or canonical Gateway, no fabricated member count.
 
-## Fidelity review
+## Required fidelity surfaces
 
-- Preserved the selected direction's deadpan Western trash-panda character, paper grain, black/acid-green palette, condensed display type, hard rules, and editorial two-column composition.
-- Adapted the selected mock into a functional one-screen buy surface: input amount, fee-first net 99/1 route budgets, pre-launch lock state, live member status, and a direct link to the proof page.
-- Replaced the mock's automatic wallet prompt with the approved behavior: the page makes no wallet request on load; a wallet request can occur only after an enabled BUY action.
-- `PENSION MEMBERS` is explicitly defined as unique recipients in the canonical Gateway's successful `SplitBuy` events where `stockAmountOut > 0`.
-- Global holder state changes the headline and raccoon art across pre-launch, loading/error, zero, growing, and crowded stages.
+- Typography: Bebas Neue preserves the compressed editorial display voice; the final hero is a three-line block at the source's scale, with the punchline in acid green. IBM Plex Mono carries labels and status copy.
+- Spacing and layout: the final desktop uses the source's dominant left hero, oversized lower-left raccoon, right poster card, separate CTA, and centered footer slogan. Desktop and mobile remain single-viewport layouts without overflow.
+- Colors and tokens: paper, black, acid green, muted gray, orange focus state, hard rules, and the subtle print texture map directly to the selected direction.
+- Image quality: the approved deadpan raccoon art is rendered as a real raster asset at source-like visual weight. Existing 401KEK and canonical QQQ assets are used rather than code-drawn substitutes.
+- Copy and content: the selected structure is preserved while wallet-connect placeholder copy is replaced by truthful pre-launch and on-chain-member states.
 
-## Responsive and interaction checks
+## Findings and comparison history
 
-- Desktop 1440 × 1024: one viewport, no horizontal or vertical page overflow.
-- Mobile 390 × 844: one viewport, all core content and the disabled CTA remain visible; no horizontal overflow.
-- Amount input test: `1.5` ETH produced `1.4850` and `0.0150` route budgets at the current zero explicit-fee configuration, then was restored to `0.20`.
-- Pre-launch CTA is disabled and labeled `CA LOADING`.
-- `VIEW FORMULA` opens `/proof`; `BACK TO BUY` returns to `/`.
-- `/proof` exposes the fee-first formulas, the on-chain member-count definition, and the corresponding calculation/settlement Solidity excerpts.
-- Browser diagnostics contained no error or warning entries; only Vite development messages and the React DevTools informational notice were present.
-- Production build, Sites packaging tests, and all 15 Foundry contract tests passed.
+### Iteration 1 — blocked
 
-## Comparison history
+- P1: the initial implementation changed the selected poster into a tall transaction form. Evidence: `audit-revision/01-current-1440.png` showed a default `0.20 ETH`, smaller raccoon, non-accented technical headline, and an embedded CTA.
+- P1: the arbitrary default amount implied a meaningful order before an official route existed.
+- P2: `VIEW FORMULA` competed with the chain mark in the header and the right panel no longer matched the selected card-plus-CTA composition.
 
-- Early desktop pass allowed the buy panel to collide with the footer at short heights; the panel height and low-height grid were constrained.
-- Early mobile passes hid the raccoon, pushed the CTA below the fold, and inherited a two-column layout; mobile now uses an explicit single-column, one-screen grid.
-- Final desktop pass increased the raccoon presence and panel height and broke the headline into a stronger three-line editorial block to better match the selected source.
+Fixes:
 
-## Intentional differences
+- Removed every default ETH value from the homepage.
+- Restored a source-scale three-line headline, green punchline, oversized raccoon, poster-style 99/1 card, gray route-status row, and separate CTA.
+- Moved the formula link into the footer.
+- Kept the homepage amount-free in both pre-launch and live states. On a live route, BUY opens a focused amount dialog; the wallet is requested only after amount confirmation.
 
-- Copy reflects verified runtime state rather than the selected mock's placeholder wallet-connect state.
-- The live BUY action remains locked until the official CA, canonical Gateway, activation block, quote endpoint, and canonical QQQ route are configured.
-- The extra `VIEW FORMULA` affordance exists because the operating logic must live on a separate public page.
+### Iteration 2 — passed
+
+- Full comparison `audit-revision/compare-final.png` confirms the same hierarchy, crop, rhythm, palette, typography treatment, hero weight, panel placement, and CTA separation.
+- Focused comparison `audit-revision/compare-panel-final.png` confirms matching row structure and proportions. The project and QQQ badges intentionally use the real project/canonical assets rather than the mock's illustrative black circles.
+- Mobile `audit-revision/08-final-mobile-390.png` retains the complete hero, status, raccoon, panel, disabled CTA, and slogan in one viewport.
+- No actionable P0/P1/P2 fidelity issues remain. The future raccoon micro-video is a separate optional enhancement, not a QA requirement for this still-image target.
+
+## Interaction and runtime checks
+
+- Pre-launch CTA is disabled and labeled `CA LOADING`; no amount input exists on the homepage.
+- A simulated market-ready configuration exposed one `BUY 99/1` control and no automatic wallet request.
+- BUY opened the amount dialog; blank input kept confirmation disabled.
+- Entering `1.5` ETH produced `1.4850 ETH` and `0.0150 ETH` route budgets at the current zero explicit-fee configuration.
+- Closing the dialog removed it cleanly.
+- `VIEW FORMULA` opened `/proof`; `BACK TO BUY` returned to `/`.
+- Browser diagnostics contained no errors or warnings.
+- `npm run verify` passed the production build, all 4 Sites tests, and all 15 Foundry contract tests.
+
+## Accessibility and limits
+
+- Buttons, links, amount input, close control, dialog semantics, focus states, Escape closing, and reduced-motion fallback are implemented.
+- Screenshots support visual checks but do not prove full screen-reader or real-wallet compatibility; production wallet and quote-endpoint testing still requires verified launch configuration.
 
 final result: passed

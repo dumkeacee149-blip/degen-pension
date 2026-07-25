@@ -39,7 +39,7 @@ npm run verify
 
 首页不在加载时请求钱包权限。`PENSION MEMBERS` 通过 Robinhood Chain 只读 RPC 统计 canonical Gateway 的 `SplitBuy` 日志：筛选 `stockAmountOut > 0` 后，按 `recipient` 去重。它表示历史上经官方 99/1 路径实际收到过 QQQ 的唯一地址数，不等于真人数、项目币 holder 数或 QQQ 的全链 holder 数。
 
-点击真实买入按钮时才会请求钱包连接。上线配置参考 [`.env.example`](.env.example)；CA 或 Gateway 未配置时，页面保持 `CA LOADING`，不展示伪造人数，也不会请求交易。
+首页不预填或展示任意 ETH 金额。市场上线后，点击 `BUY 99/1` 才打开金额层；只有用户填写金额并确认后才请求钱包连接。上线配置参考 [`.env.example`](.env.example)；CA 或 Gateway 未配置时，页面保持 `CA LOADING`，不展示伪造人数，也不会请求交易。
 
 运转公式和对应 Solidity 代码展示在独立的 `/proof` 页面。
 

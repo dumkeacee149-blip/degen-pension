@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
-  ArrowRight,
   Calculator,
   CheckCircle,
   Code,
@@ -10,6 +9,7 @@ import {
   UsersThree,
   Wallet,
   WarningCircle,
+  X,
 } from "@phosphor-icons/react";
 import { MARKET, ROBINHOOD_CHAIN as CHAIN } from "./config.js";
 import { loadMemberStats } from "./memberStats.js";
@@ -79,9 +79,10 @@ function getPublicStage(stats) {
   if (stats.status === "prelaunch") {
     return {
       key: "prelaunch",
-      status: "PENSION MEMBERS: CA LOADING",
-      headline: "I CAN’T COUNT THE DEGENS UNTIL THE GATEWAY EXISTS.",
-      subline: "NO GATEWAY. NO FAKE NUMBER.",
+      status: "STATUS: CA LOADING",
+      headline: ["I CAN’T JUDGE", "YOUR BAG UNTIL"],
+      accent: "THE 1% LANDS.",
+      subline: "MEMBERS START AT THE FIRST 1%.",
       art: "/assets/raccoon-deadpan-v2.png",
     };
   }
@@ -89,7 +90,8 @@ function getPublicStage(stats) {
     return {
       key: "loading",
       status: "PENSION MEMBERS: COUNTING",
-      headline: "COUNTING BAD DECISIONS ON-CHAIN.",
+      headline: ["THE RACCOON IS", "COUNTING BAD"],
+      accent: "DECISIONS.",
       subline: "READING OFFICIAL 99/1 EVENTS.",
       art: "/assets/raccoon-deadpan-v2.png",
     };
@@ -98,7 +100,8 @@ function getPublicStage(stats) {
     return {
       key: "error",
       status: "PENSION MEMBERS: UNAVAILABLE",
-      headline: "THE CHAIN STOPPED RETURNING MY CALLS.",
+      headline: ["THE CHAIN LEFT", "MY CALL ON"],
+      accent: "READ.",
       subline: "COUNT UNKNOWN. FUNDS UNTOUCHED.",
       art: "/assets/raccoon-deadpan-v2.png",
     };
@@ -109,7 +112,8 @@ function getPublicStage(stats) {
     return {
       key: "empty",
       status: "PENSION MEMBERS: 0",
-      headline: "ZERO MEMBERS. STRONG START.",
+      headline: ["ZERO MEMBERS.", "A BEAUTIFUL"],
+      accent: "DISASTER.",
       subline: "BE THE FIRST BAD RETIREMENT DECISION.",
       art: "/assets/raccoon-deadpan-v2.png",
     };
@@ -118,7 +122,8 @@ function getPublicStage(stats) {
     return {
       key: "growing",
       status: `PENSION MEMBERS: ${count.toLocaleString("en-US")}`,
-      headline: `${count.toLocaleString("en-US")} DEGENS. ONE ADULT PERCENT.`,
+      headline: [`${count.toLocaleString("en-US")} DEGENS.`, "ONE ADULT"],
+      accent: "PERCENT.",
       subline: "THE RACCOON HAS STARTED A SPREADSHEET.",
       art: "/assets/raccoon-alert-v2.png",
     };
@@ -126,7 +131,8 @@ function getPublicStage(stats) {
   return {
     key: "crowded",
     status: `PENSION MEMBERS: ${count.toLocaleString("en-US")}`,
-    headline: "THIS IS SOMEHOW A PENSION FUND NOW.",
+    headline: ["THIS IS SOMEHOW", "A PENSION FUND"],
+    accent: "NOW.",
     subline: `${count.toLocaleString("en-US")} UNIQUE 1% QQQ RECIPIENTS.`,
     art: "/assets/raccoon-employed-v2.png",
   };
@@ -185,15 +191,26 @@ function NetworkLabel() {
 function HomePage() {
   const stats = useMemberStats();
   const stage = getPublicStage(stats);
-  const [amount, setAmount] = useState("0.20");
+  const [amount, setAmount] = useState("");
+  const [isBuySheetOpen, setIsBuySheetOpen] = useState(false);
   const [actionState, setActionState] = useState("idle");
   const [actionMessage, setActionMessage] = useState("");
   const numericAmount = useMemo(() => Number(amount), [amount]);
-  const canBuy = MARKET.marketReady && Number.isFinite(numericAmount) && numericAmount > 0;
+  const hasAmount = amount !== "" && Number.isFinite(numericAmount) && numericAmount > 0;
+  const canBuy = MARKET.marketReady && hasAmount;
 
   useEffect(() => {
     document.title = "DEGEN PENSION — 99% APE. 1% ADULT.";
   }, []);
+
+  useEffect(() => {
+    if (!isBuySheetOpen) return undefined;
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape" && actionState !== "working") setIsBuySheetOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [isBuySheetOpen, actionState]);
 
   const buy = async () => {
     if (!canBuy || actionState === "working") return;
@@ -254,74 +271,136 @@ function HomePage() {
 
   const buttonLabel = !MARKET.marketReady
     ? "CA LOADING"
-    : actionState === "working"
-      ? "OPENING WALLET…"
-      : "BUY 99/1";
+    : "BUY 99/1";
+
+  const defaultActionMessage = !MARKET.marketReady
+    ? "NO CA. NO WALLET REQUEST. NO FAKE ORDER."
+    : "CLICK BUY. ENTER AMOUNT. THEN THE WALLET OPENS.";
 
   return (
     <div className={`home-page stage-${stage.key}`}>
       <header className="home-header">
         <Brand />
         <div className="home-header-right">
-          <a className="proof-link" href="/proof">VIEW FORMULA <ArrowRight size={16} weight="bold" /></a>
           <NetworkLabel />
         </div>
       </header>
 
       <main className="home-main">
         <section className="reaction-stage" aria-live="polite">
-          <h1>{stage.headline}</h1>
+          <h1>
+            {stage.headline.map((line) => <span key={line}>{line}</span>)}
+            <em>{stage.accent}</em>
+          </h1>
           <div className="member-status"><UsersThree size={19} weight="fill" />{stage.status}</div>
           <p className="stage-subline">{stage.subline}</p>
-          <img className="raccoon-art" src={stage.art} alt="A tired cartoon raccoon in a cheap green tie holding an empty coffee cup" />
+          <div className="raccoon-media">
+            <img className="raccoon-art" src={stage.art} alt="A tired cartoon raccoon in a cheap green tie holding an empty coffee cup" />
+          </div>
         </section>
 
-        <section className="buy-panel" aria-labelledby="buy-panel-title">
-          <div className="buy-panel-title" id="buy-panel-title">
-            <span>99/1 BUY</span>
-            <b>{MARKET.marketReady ? "LIVE ROUTE" : "PRE-LAUNCH"}</b>
-          </div>
-
-          <label className="amount-input">
-            <span>YOU PAY</span>
-            <div>
-              <input
-                value={amount}
-                onChange={(event) => setAmount(sanitizeAmount(event.target.value))}
-                inputMode="decimal"
-                aria-label="ETH amount"
-              />
-              <b>ETH</b>
+        <div className="buy-stack">
+          <section className="buy-panel buy-panel-preview" aria-labelledby="buy-panel-title">
+            <div className="buy-panel-title" id="buy-panel-title">
+              <span>99/1 BUY PREVIEW</span>
+              <b>{MARKET.marketReady ? "LIVE ROUTE" : "PRE-LAUNCH"}</b>
             </div>
-          </label>
 
-          <div className="allocation allocation-project">
-            <div><strong>99%</strong><span>$401KEK</span></div>
-            <img src="/brand/mark-99-1.png" alt="401KEK" />
-            <small>{splitAmount(amount, 0.99)} ETH ROUTE BUDGET</small>
-          </div>
+            <div className="allocation allocation-project">
+              <div><strong>99%</strong><span>$401KEK</span></div>
+              <img src="/brand/mark-99-1.png" alt="401KEK" />
+              <small>99% OF NET INPUT</small>
+            </div>
 
-          <div className="allocation allocation-stock">
-            <div><strong>1%</strong><span>QQQ</span></div>
-            <img src="/assets/qqq-stock-token.png" alt="QQQ Robinhood Stock Token" />
-            <small>{splitAmount(amount, 0.01)} ETH ROUTE BUDGET</small>
-          </div>
+            <div className="allocation allocation-stock">
+              <div><strong>1%</strong><span>QQQ</span></div>
+              <img src="/assets/qqq-stock-token.png" alt="QQQ Robinhood Stock Token" />
+              <small>1% OF NET INPUT</small>
+            </div>
 
-          <button className="buy-button" type="button" onClick={buy} disabled={!canBuy || actionState === "working"}>
+            <div className="panel-state">
+              {MARKET.marketReady
+                ? <CheckCircle size={28} weight="fill" />
+                : <LockKey size={28} weight="bold" />}
+              <span>{MARKET.marketReady ? "BOTH LEGS OR NEITHER" : "OFFICIAL GATEWAY NOT LIVE"}</span>
+            </div>
+          </section>
+
+          <button
+            className="buy-button"
+            type="button"
+            onClick={() => {
+              setActionState("idle");
+              setActionMessage("");
+              setIsBuySheetOpen(true);
+            }}
+            disabled={!MARKET.marketReady || actionState === "working"}
+          >
             {buttonLabel}
             {MARKET.marketReady ? <Wallet size={25} weight="fill" /> : <LockKey size={25} weight="fill" />}
           </button>
 
           <p className={`action-message${actionState === "error" ? " action-error" : ""}`}>
-            {actionMessage || "NO WALLET CONNECTION UNTIL YOU PRESS BUY. FEES APPLY BEFORE THE NET 99/1 SPLIT."}
+            {actionMessage || defaultActionMessage}
           </p>
-        </section>
+        </div>
       </main>
 
+      {isBuySheetOpen && (
+        <div
+          className="buy-dialog-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && actionState !== "working") setIsBuySheetOpen(false);
+          }}
+        >
+          <section className="buy-dialog" role="dialog" aria-modal="true" aria-labelledby="buy-dialog-title">
+            <div className="buy-dialog-head">
+              <div>
+                <span id="buy-dialog-title">MAKE THE BAD DECISION</span>
+                <small>FEES FIRST. THEN 99/1.</small>
+              </div>
+              <button type="button" aria-label="Close buy dialog" onClick={() => setIsBuySheetOpen(false)} disabled={actionState === "working"}>
+                <X size={24} weight="bold" />
+              </button>
+            </div>
+
+            <label className="amount-input amount-input-dialog">
+              <span>YOU PAY</span>
+              <div>
+                <input
+                  autoFocus
+                  value={amount}
+                  onChange={(event) => setAmount(sanitizeAmount(event.target.value))}
+                  inputMode="decimal"
+                  placeholder="0.00"
+                  aria-label="ETH amount"
+                />
+                <b>ETH</b>
+              </div>
+            </label>
+
+            <div className="dialog-split">
+              <div><b>99%</b><span>{hasAmount ? `${splitAmount(amount, 0.99)} ETH` : "—"}<small>$401KEK ROUTE</small></span></div>
+              <div><b>1%</b><span>{hasAmount ? `${splitAmount(amount, 0.01)} ETH` : "—"}<small>QQQ ROUTE</small></span></div>
+            </div>
+
+            <button className="dialog-buy-button" type="button" onClick={buy} disabled={!canBuy || actionState === "working"}>
+              {actionState === "working" ? "OPENING WALLET…" : hasAmount ? "CONFIRM 99/1" : "ENTER AMOUNT"}
+              <Wallet size={23} weight="fill" />
+            </button>
+            <p className={`dialog-message${actionState === "error" ? " action-error" : ""}`}>
+              {actionMessage || "NO WALLET REQUEST UNTIL CONFIRM. BOTH LEGS OR NEITHER."}
+            </p>
+          </section>
+        </div>
+      )}
+
       <footer className="home-footer">
-        <span><b>99%</b> APE.</span>
-        <span><b>1%</b> ADULT.</span>
-        <span className="footer-proof">MEMBERS = UNIQUE OFFICIAL 1% QQQ RECIPIENTS</span>
+        <div className="footer-slogan">
+          <span><b>99%</b> APE.</span>
+          <span><b>1%</b> ADULT.</span>
+        </div>
+        <a className="footer-proof" href="/proof">VIEW FORMULA →</a>
       </footer>
     </div>
   );
