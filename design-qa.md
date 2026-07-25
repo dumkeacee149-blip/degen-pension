@@ -1,56 +1,45 @@
-# Design QA — DEGEN PENSION
+# Design QA
+
+## Evidence
+
+- Selected visual source: `design-sources/western-deadpan-selected.png` (1487 × 1058).
+- Desktop implementation: `qa/home-1440-final-v2.png` (1440 × 1024 viewport and document).
+- Normalized source: `qa/source-1440.png` (1440 × 1024).
+- Full side-by-side: `qa/comparison-1440.png`.
+- Focused buy-panel comparison: `qa/comparison-panel.png`.
+- Mobile implementation: `qa/home-mobile-390-v6.png` (390 × 844 viewport and document).
+- Formula page: `qa/proof-1440-viewport-v2.png`; route `/proof`.
+- Validated state: pre-launch, with no verified CA/Gateway configured and no fabricated member count.
+
+## Fidelity review
+
+- Preserved the selected direction's deadpan Western trash-panda character, paper grain, black/acid-green palette, condensed display type, hard rules, and editorial two-column composition.
+- Adapted the selected mock into a functional one-screen buy surface: input amount, fee-first net 99/1 route budgets, pre-launch lock state, live member status, and a direct link to the proof page.
+- Replaced the mock's automatic wallet prompt with the approved behavior: the page makes no wallet request on load; a wallet request can occur only after an enabled BUY action.
+- `PENSION MEMBERS` is explicitly defined as unique recipients in the canonical Gateway's successful `SplitBuy` events where `stockAmountOut > 0`.
+- Global holder state changes the headline and raccoon art across pre-launch, loading/error, zero, growing, and crowded stages.
+
+## Responsive and interaction checks
+
+- Desktop 1440 × 1024: one viewport, no horizontal or vertical page overflow.
+- Mobile 390 × 844: one viewport, all core content and the disabled CTA remain visible; no horizontal overflow.
+- Amount input test: `1.5` ETH produced `1.4850` and `0.0150` route budgets at the current zero explicit-fee configuration, then was restored to `0.20`.
+- Pre-launch CTA is disabled and labeled `CA LOADING`.
+- `VIEW FORMULA` opens `/proof`; `BACK TO BUY` returns to `/`.
+- `/proof` exposes the fee-first formulas, the on-chain member-count definition, and the corresponding calculation/settlement Solidity excerpts.
+- Browser diagnostics contained no error or warning entries; only Vite development messages and the React DevTools informational notice were present.
+- Production build, Sites packaging tests, and all 15 Foundry contract tests passed.
+
+## Comparison history
+
+- Early desktop pass allowed the buy panel to collide with the footer at short heights; the panel height and low-height grid were constrained.
+- Early mobile passes hid the raccoon, pushed the CTA below the fold, and inherited a two-column layout; mobile now uses an explicit single-column, one-screen grid.
+- Final desktop pass increased the raccoon presence and panel height and broke the headline into a stronger three-line editorial block to better match the selected source.
+
+## Intentional differences
+
+- Copy reflects verified runtime state rather than the selected mock's placeholder wallet-connect state.
+- The live BUY action remains locked until the official CA, canonical Gateway, activation block, quote endpoint, and canonical QQQ route are configured.
+- The extra `VIEW FORMULA` affordance exists because the operating logic must live on a separate public page.
 
 final result: passed
-
-## Visual source and target
-
-- Selected source: `/Users/a7/Documents/Codex/2026-07-24/ni/.design-options/midnight-office.png`
-- Source dimensions: 1440×1024
-- Primary implementation viewport: 1440×1024 browser override; rendered page client width 1425px after scrollbar allocation
-- Final desktop capture: `.design-qa/final-desktop.png`
-- Final mobile capture: `.design-qa/final-mobile.png`
-- Side-by-side comparisons: `.design-qa/compare-v1.png` and `.design-qa/compare-v2.png`
-
-The source and implementation were placed together in one 2850×1013 comparison image. The second pass reduced excess hero top space, brought the full primary CTA into the first viewport, shifted the character crop to retain 1仔, and replaced the placeholder Q chip with Robinhood's official QQQ token logo.
-
-## Visible comparison
-
-### Matched
-
-- Black / old-ledger cream / acid green / rust palette
-- Oversized condensed headline and mono terminal labels
-- Left split-buy panel with one dominant 99/1 bar
-- Editorial ink-and-halftone raccoon office art
-- Hard borders, ledger rules and restrained square geometry
-- Trust strip immediately below the primary product surface
-
-### Intentional differences
-
-- The prototype adds explicit `MVP TESTED`, `AWAITING OFFICIAL CA` and `PRE-LAUNCH DEMO` states so the page cannot be mistaken for a live market.
-- Fake portfolio and activity routes from the visual concept were omitted because they are not part of the core task.
-- The product panel shows route budgets rather than fabricated output-token quantities.
-
-## Interaction QA
-
-- Amount input changed from `0.20` to `1.5`; UI produced exactly `1.4850 ETH` and `0.0150 ETH` route budgets.
-- `REVIEW 99/1 SPLIT` opened a readable review dialog with fee-first semantics, both atomic legs and a clear no-live-market warning.
-- Close action and Escape handling are wired.
-- Wallet connection checks for an injected provider; without one, the page shows an honest fallback and does not fabricate a connection.
-- Mobile navigation opens and exposes all four primary section links.
-- Canonical QQQ address has a copy action.
-
-## Responsive and accessibility QA
-
-- Desktop: 1425px document width / 1425px client width; no horizontal overflow.
-- Mobile: 375px document width / 375px client width at a 390×844 browser viewport; no horizontal overflow.
-- No unnamed buttons, links or inputs were found.
-- No images were missing `alt` attributes.
-- Focus-visible styling and reduced-motion handling are present.
-
-## Runtime QA
-
-- Browser console: 0 warnings, 0 errors.
-- `npm run build`: passed.
-- Sites worker tests: 4/4 passed.
-- Foundry tests: 15/15 passed.
-- No mainnet deployment, live quote or transaction hash is represented in the UI.

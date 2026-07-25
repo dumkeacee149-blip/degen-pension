@@ -35,6 +35,14 @@ npm run verify
 
 详细规则见 [项目计划](docs/PROJECT_PLAN.md)、[发布 Runbook](docs/LAUNCH_RUNBOOK.md)、[品牌 Playbook](docs/BRAND_PLAYBOOK.md) 与 [Robinhood Chain 配置核验记录](docs/VERIFIED_CHAIN_CONFIG.md)。
 
+## 网站数据口径
+
+首页不在加载时请求钱包权限。`PENSION MEMBERS` 通过 Robinhood Chain 只读 RPC 统计 canonical Gateway 的 `SplitBuy` 日志：筛选 `stockAmountOut > 0` 后，按 `recipient` 去重。它表示历史上经官方 99/1 路径实际收到过 QQQ 的唯一地址数，不等于真人数、项目币 holder 数或 QQQ 的全链 holder 数。
+
+点击真实买入按钮时才会请求钱包连接。上线配置参考 [`.env.example`](.env.example)；CA 或 Gateway 未配置时，页面保持 `CA LOADING`，不展示伪造人数，也不会请求交易。
+
+运转公式和对应 Solidity 代码展示在独立的 `/proof` 页面。
+
 CA 出现后的自动化操作见 [`ops/README.md`](ops/README.md)。操作脚本默认只做签名与 `eth_call` 演练，只有显式传入 `--broadcast` 才会发送交易；仓库内不保存裸私钥或助记词。
 
 ## 传播资产
