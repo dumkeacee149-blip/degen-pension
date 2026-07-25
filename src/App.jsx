@@ -1,60 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  ArrowLeft,
-  Calculator,
+  ArrowRight,
   CheckCircle,
-  Code,
   Hexagon,
   LockKey,
+  ShareNetwork,
   UsersThree,
   Wallet,
-  WarningCircle,
   X,
 } from "@phosphor-icons/react";
 import { MARKET, ROBINHOOD_CHAIN as CHAIN } from "./config.js";
-import { loadMemberStats } from "./memberStats.js";
-
-const EMPTY_STATS = MARKET.marketReady
-  ? { status: "loading", memberCount: null, buyCount: null, asOfBlock: null, source: "none" }
-  : { status: "prelaunch", memberCount: null, buyCount: null, asOfBlock: null, source: "none" };
-
-const CALCULATION_SOURCE = `function _calculateAmounts(uint256 grossAmountIn)
-  private view returns (BuyAmounts memory amounts)
-{
-  amounts.explicitFeeAmount =
-    grossAmountIn * explicitFeeBps / BPS_DENOMINATOR;
-  amounts.netAmountIn = grossAmountIn - amounts.explicitFeeAmount;
-  amounts.projectAmountIn =
-    amounts.netAmountIn * PROJECT_BPS / BPS_DENOMINATOR;
-  amounts.stockAmountIn =
-    amounts.netAmountIn - amounts.projectAmountIn;
-}`;
-
-const SETTLEMENT_SOURCE = `BuyAmounts memory amounts =
-  _calculateAmounts(grossAmountIn);
-if (amounts.projectAmountIn == 0 ||
-    amounts.stockAmountIn == 0) revert InvalidAmount();
-
-if (amounts.explicitFeeAmount != 0) {
-  IERC20(inputToken).safeTransfer(
-    feeRecipient,
-    amounts.explicitFeeAmount
-  );
-}
-
-projectAmountOut = _executeLeg(
-  officialToken, projectAdapter,
-  amounts.projectAmountIn, minProjectOut, recipient
-);
-stockAmountOut = _executeLeg(
-  stockToken, stockAdapter,
-  amounts.stockAmountIn, minStockOut, recipient
-);
-
-_emitSplitBuy(
-  recipient, grossAmountIn,
-  amounts, projectAmountOut, stockAmountOut
-);`;
+import { useMemberStats } from "./useMemberStats.js";
+import CodePage from "./CodePage.jsx";
+import FlowPage from "./FlowPage.jsx";
 
 function shortAddress(value) {
   if (!value) return "";
@@ -79,10 +37,12 @@ function getPublicStage(stats) {
   if (stats.status === "prelaunch") {
     return {
       key: "prelaunch",
-      status: "STATUS: CA LOADING",
-      headline: ["I CAN’T JUDGE", "YOUR BAG UNTIL"],
-      accent: "THE 1% LANDS.",
-      subline: "MEMBERS START AT THE FIRST 1%.",
+      status: "FIRST OFFICIAL MEMBER: WAITING",
+      headline: ["YOUR WORST", "FINANCIAL DECISION"],
+      accent: "NEEDS 1% ADULT SUPERVISION.",
+      subline: "BUY THE MEME. ROUTE 1% TO QQQ. PRINT THE RECEIPT.",
+      form: "CURRENT FORM: UNEMPLOYED ACCOUNTANT",
+      milestone: "FIRST OFFICIAL RECEIPT OPENS THE WALL",
       art: "/assets/raccoon-deadpan-v2.png",
     };
   }
@@ -90,20 +50,24 @@ function getPublicStage(stats) {
     return {
       key: "loading",
       status: "PENSION MEMBERS: COUNTING",
-      headline: ["THE RACCOON IS", "COUNTING BAD"],
-      accent: "DECISIONS.",
-      subline: "READING OFFICIAL 99/1 EVENTS.",
-      art: "/assets/raccoon-deadpan-v2.png",
+      headline: ["YOUR BAD DECISION", "IS BEING"],
+      accent: "AUDITED BY A RACCOON.",
+      subline: "READING OFFICIAL 99/1 RECEIPTS FROM THE CHAIN.",
+      form: "CURRENT FORM: COUNTING THE DAMAGE",
+      milestone: "NEXT OFFICE UPGRADE AT 100 MEMBERS",
+      art: "/assets/raccoon-ledger-v1.png",
     };
   }
   if (stats.status === "error") {
     return {
       key: "error",
-      status: "PENSION MEMBERS: UNAVAILABLE",
-      headline: ["THE CHAIN LEFT", "MY CALL ON"],
-      accent: "READ.",
-      subline: "COUNT UNKNOWN. FUNDS UNTOUCHED.",
-      art: "/assets/raccoon-deadpan-v2.png",
+      status: "PENSION MEMBERS: DATA UNAVAILABLE",
+      headline: ["THE CHAIN SAID", "BE RIGHT"],
+      accent: "BACK.",
+      subline: "THE COUNTER IS OFFLINE. THE BUY ROUTE IS SEPARATE.",
+      form: "CURRENT FORM: TECH SUPPORT VICTIM",
+      milestone: "MEMBER COUNT RETURNS WITH THE INDEX",
+      art: "/assets/raccoon-overtime-v1.png",
     };
   }
 
@@ -111,10 +75,12 @@ function getPublicStage(stats) {
   if (count === 0) {
     return {
       key: "empty",
-      status: "PENSION MEMBERS: 0",
-      headline: ["ZERO MEMBERS.", "A BEAUTIFUL"],
-      accent: "DISASTER.",
-      subline: "BE THE FIRST BAD RETIREMENT DECISION.",
+      status: "FIRST OFFICIAL MEMBER: WAITING",
+      headline: ["THE PENSION WALL", "IS PAINFULLY"],
+      accent: "EMPTY.",
+      subline: "THE FIRST OFFICIAL 99/1 RECEIPT GETS THE FIRST FRAME.",
+      form: "CURRENT FORM: EMPTY OFFICE",
+      milestone: "CLAIM THE FIRST ONCHAIN RECEIPT",
       art: "/assets/raccoon-deadpan-v2.png",
     };
   }
@@ -122,57 +88,30 @@ function getPublicStage(stats) {
     return {
       key: "growing",
       status: `PENSION MEMBERS: ${count.toLocaleString("en-US")}`,
-      headline: [`${count.toLocaleString("en-US")} DEGENS.`, "ONE ADULT"],
-      accent: "PERCENT.",
-      subline: "THE RACCOON HAS STARTED A SPREADSHEET.",
-      art: "/assets/raccoon-alert-v2.png",
+      headline: [`${count.toLocaleString("en-US")} BAD DECISIONS.`, "ONE GROWING"],
+      accent: "PENSION WALL.",
+      subline: "EVERY MEMBER HAS AN OFFICIAL 1% QQQ RECEIPT.",
+      form: "CURRENT FORM: JUNIOR BOOKKEEPER",
+      milestone: `${100 - count} MORE MEMBERS UNTIL THE OFFICE UPGRADE`,
+      art: "/assets/raccoon-watch-chart-v1.png",
     };
   }
   return {
     key: "crowded",
     status: `PENSION MEMBERS: ${count.toLocaleString("en-US")}`,
-    headline: ["THIS IS SOMEHOW", "A PENSION FUND"],
-    accent: "NOW.",
-    subline: `${count.toLocaleString("en-US")} UNIQUE 1% QQQ RECIPIENTS.`,
-    art: "/assets/raccoon-employed-v2.png",
+    headline: ["THE GROUP CHAT", "HAS A PENSION"],
+    accent: "DEPARTMENT NOW.",
+    subline: `${count.toLocaleString("en-US")} UNIQUE WALLETS WITH OFFICIAL 1% QQQ RECEIPTS.`,
+    form: "CURRENT FORM: ABSOLUTELY EMPLOYED",
+    milestone: "THE NEXT UPGRADE IS DECIDED BY THE CROWD",
+    art: "/assets/raccoon-reluctant-celebration-v1.png",
   };
-}
-
-function useMemberStats() {
-  const [stats, setStats] = useState(EMPTY_STATS);
-
-  useEffect(() => {
-    if (!MARKET.marketReady) return undefined;
-    const controller = new AbortController();
-
-    const refresh = async () => {
-      try {
-        const next = await loadMemberStats({ signal: controller.signal });
-        setStats(next);
-      } catch (error) {
-        if (error?.name !== "AbortError") {
-          setStats((current) => current.status === "ready"
-            ? { ...current, stale: true }
-            : { status: "error", memberCount: null, buyCount: null, asOfBlock: null, source: "none" });
-        }
-      }
-    };
-
-    refresh();
-    const interval = window.setInterval(refresh, 60_000);
-    return () => {
-      controller.abort();
-      window.clearInterval(interval);
-    };
-  }, []);
-
-  return stats;
 }
 
 function Brand({ compact = false }) {
   return (
     <a className={`brand${compact ? " brand-compact" : ""}`} href="/" aria-label="Degen Pension home">
-      <img src="/brand/mark-99-1.png" alt="" />
+      <img src="/brand/mark-99-1-v2.png" alt="" />
       <span>DEGEN PENSION</span>
       <b>401KEK</b>
     </a>
@@ -195,12 +134,14 @@ function HomePage() {
   const [isBuySheetOpen, setIsBuySheetOpen] = useState(false);
   const [actionState, setActionState] = useState("idle");
   const [actionMessage, setActionMessage] = useState("");
+  const [submittedHash, setSubmittedHash] = useState("");
+  const [shareLabel, setShareLabel] = useState("SHARE THE BAD PLAN");
   const numericAmount = useMemo(() => Number(amount), [amount]);
   const hasAmount = amount !== "" && Number.isFinite(numericAmount) && numericAmount > 0;
   const canBuy = MARKET.marketReady && hasAmount;
 
   useEffect(() => {
-    document.title = "DEGEN PENSION — 99% APE. 1% ADULT.";
+    document.title = "DEGEN PENSION - 99% APE. 1% ADULT.";
   }, []);
 
   useEffect(() => {
@@ -261,33 +202,67 @@ function HomePage() {
         method: "eth_sendTransaction",
         params: [{ from: wallet, to: transaction.to, data: transaction.data, value: transaction.value }],
       });
+      setSubmittedHash(transactionHash);
       setActionState("success");
-      setActionMessage(`SUBMITTED ${shortAddress(transactionHash)} · BOTH LEGS OR NEITHER.`);
+      setActionMessage(`SUBMITTED ${shortAddress(transactionHash)}. BOTH LEGS OR NEITHER.`);
     } catch (error) {
       setActionState("error");
       setActionMessage(String(error?.message || "Transaction cancelled.").toUpperCase());
     }
   };
 
-  const buttonLabel = !MARKET.marketReady
-    ? "CA LOADING"
-    : "BUY 99/1";
+  const shareReceipt = async () => {
+    if (!submittedHash) return;
+    const explorerUrl = `${CHAIN.blockExplorerUrls[0]}/tx/${submittedHash}`;
+    const receiptText = `My 99/1 pension receipt is pending confirmation: 99% $401KEK, 1% QQQ. ${explorerUrl}`;
+    try {
+      if (navigator.share) {
+        await navigator.share({ title: "DEGEN PENSION RECEIPT", text: receiptText });
+      } else {
+        await navigator.clipboard.writeText(receiptText);
+      }
+      setActionMessage("PENDING RECEIPT SHARED. MEMBER NUMBER PRINTS AFTER CONFIRMATION.");
+    } catch (error) {
+      if (error?.name !== "AbortError") setActionMessage("COULD NOT SHARE. THE EXPLORER LINK IS STILL AVAILABLE BELOW.");
+    }
+  };
+
+  const sharePlan = async () => {
+    const shareData = {
+      title: "DEGEN PENSION",
+      text: "A retirement plan for people who buy meme coins: 99% $401KEK, 1% QQQ. 99% APE. 1% ADULT.",
+      url: window.location.origin,
+    };
+
+    try {
+      if (navigator.share) {
+        await navigator.share(shareData);
+        setShareLabel("PLAN SHARED");
+      } else {
+        await navigator.clipboard.writeText(`${shareData.text} ${shareData.url}`);
+        setShareLabel("PLAN COPIED");
+      }
+    } catch (error) {
+      if (error?.name !== "AbortError") setShareLabel("COPY FAILED");
+    }
+
+    window.setTimeout(() => setShareLabel("SHARE THE BAD PLAN"), 1800);
+  };
 
   const defaultActionMessage = !MARKET.marketReady
-    ? "NO CA. NO WALLET REQUEST. NO FAKE ORDER."
+    ? "THE OFFICIAL CA AND GATEWAY WILL APPEAR HERE. NO WALLET REQUEST BEFORE THEN."
     : "CLICK BUY. ENTER AMOUNT. THEN THE WALLET OPENS.";
 
   return (
     <div className={`home-page stage-${stage.key}`}>
       <header className="home-header">
         <Brand />
-        <div className="home-header-right">
-          <NetworkLabel />
-        </div>
+        <div className="home-header-right"><NetworkLabel /></div>
       </header>
 
       <main className="home-main">
         <section className="reaction-stage" aria-live="polite">
+          <p className="hero-kicker">THE UNOFFICIAL RETIREMENT PLAN FOR PEOPLE WHO BUY MEMECOINS</p>
           <h1>
             {stage.headline.map((line) => <span key={line}>{line}</span>)}
             <em>{stage.accent}</em>
@@ -295,50 +270,66 @@ function HomePage() {
           <div className="member-status"><UsersThree size={19} weight="fill" />{stage.status}</div>
           <p className="stage-subline">{stage.subline}</p>
           <div className="raccoon-media">
-            <img className="raccoon-art" src={stage.art} alt="A tired cartoon raccoon in a cheap green tie holding an empty coffee cup" />
+            <img className="raccoon-art" src={stage.art} alt="The tired deadpan office raccoon reacting to the current official member stage" />
+            <span className="raccoon-form">{stage.form}</span>
           </div>
         </section>
 
         <div className="buy-stack">
-          <section className="buy-panel buy-panel-preview" aria-labelledby="buy-panel-title">
+          <section className={`buy-panel buy-panel-preview${MARKET.marketReady ? "" : " buy-panel-prelaunch"}`} aria-labelledby="buy-panel-title">
             <div className="buy-panel-title" id="buy-panel-title">
-              <span>99/1 BUY PREVIEW</span>
-              <b>{MARKET.marketReady ? "LIVE ROUTE" : "PRE-LAUNCH"}</b>
+              <span>YOUR 99/1 RECEIPT</span>
+              <b>{MARKET.marketReady ? "ONCHAIN" : "FIRST FRAME OPEN"}</b>
             </div>
+
+            {MARKET.marketReady ? (
+              <div className="member-ticket">
+                <span>OFFICIAL MEMBERS</span>
+                <strong>{stats.memberCount !== null ? stats.memberCount.toLocaleString("en-US") : "…"}</strong>
+                <small>{stage.milestone}</small>
+              </div>
+            ) : null}
 
             <div className="allocation allocation-project">
               <div><strong>99%</strong><span>$401KEK</span></div>
-              <img src="/brand/mark-99-1.png" alt="401KEK" />
-              <small>99% OF NET INPUT</small>
+              <img src="/assets/badge-401kek-v1.png" alt="401KEK black circle badge" />
+              <small>OF NET INPUT BUYS THE OFFICIAL MEME</small>
             </div>
 
             <div className="allocation allocation-stock">
               <div><strong>1%</strong><span>QQQ</span></div>
-              <img src="/assets/qqq-stock-token.png" alt="QQQ Robinhood Stock Token" />
-              <small>1% OF NET INPUT</small>
+              <img src="/assets/badge-qqq-v1.png" alt="QQQ black circle badge" />
+              <small>OF NET INPUT BUYS CANONICAL QQQ</small>
             </div>
 
             <div className="panel-state">
-              {MARKET.marketReady
-                ? <CheckCircle size={28} weight="fill" />
-                : <LockKey size={28} weight="bold" />}
-              <span>{MARKET.marketReady ? "BOTH LEGS OR NEITHER" : "OFFICIAL GATEWAY NOT LIVE"}</span>
+              {MARKET.marketReady ? <CheckCircle size={26} weight="fill" /> : <LockKey size={26} weight="bold" />}
+              <span>{MARKET.marketReady ? "TWO ASSETS. ONE RECEIPT." : "RECEIPT PRINTS AFTER LAUNCH"}</span>
             </div>
           </section>
 
-          <button
-            className="buy-button"
-            type="button"
-            onClick={() => {
-              setActionState("idle");
-              setActionMessage("");
-              setIsBuySheetOpen(true);
-            }}
-            disabled={!MARKET.marketReady || actionState === "working"}
-          >
-            {buttonLabel}
-            {MARKET.marketReady ? <Wallet size={25} weight="fill" /> : <LockKey size={25} weight="fill" />}
-          </button>
+          <div className="home-actions">
+            {MARKET.marketReady ? (
+              <button
+                className="buy-button"
+                type="button"
+                onClick={() => {
+                  setActionState("idle");
+                  setActionMessage("");
+                  setSubmittedHash("");
+                  setIsBuySheetOpen(true);
+                }}
+                disabled={actionState === "working"}
+              >
+                BUY 99/1 <Wallet size={25} weight="fill" />
+              </button>
+            ) : (
+              <a className="buy-button" href="/flow">SEE THE 3-BEAT TRICK <ArrowRight size={25} weight="bold" /></a>
+            )}
+            <button className="share-button" type="button" onClick={sharePlan}>
+              <ShareNetwork size={20} weight="bold" /> {shareLabel}
+            </button>
+          </div>
 
           <p className={`action-message${actionState === "error" ? " action-error" : ""}`}>
             {actionMessage || defaultActionMessage}
@@ -347,18 +338,12 @@ function HomePage() {
       </main>
 
       {isBuySheetOpen && (
-        <div
-          className="buy-dialog-backdrop"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget && actionState !== "working") setIsBuySheetOpen(false);
-          }}
-        >
+        <div className="buy-dialog-backdrop" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && actionState !== "working") setIsBuySheetOpen(false);
+        }}>
           <section className="buy-dialog" role="dialog" aria-modal="true" aria-labelledby="buy-dialog-title">
             <div className="buy-dialog-head">
-              <div>
-                <span id="buy-dialog-title">MAKE THE BAD DECISION</span>
-                <small>FEES FIRST. THEN 99/1.</small>
-              </div>
+              <div><span id="buy-dialog-title">MAKE THE BAD DECISION</span><small>FEES FIRST. THEN 99/1.</small></div>
               <button type="button" aria-label="Close buy dialog" onClick={() => setIsBuySheetOpen(false)} disabled={actionState === "working"}>
                 <X size={24} weight="bold" />
               </button>
@@ -367,27 +352,34 @@ function HomePage() {
             <label className="amount-input amount-input-dialog">
               <span>YOU PAY</span>
               <div>
-                <input
-                  autoFocus
-                  value={amount}
-                  onChange={(event) => setAmount(sanitizeAmount(event.target.value))}
-                  inputMode="decimal"
-                  placeholder="0.00"
-                  aria-label="ETH amount"
-                />
+                <input autoFocus value={amount} onChange={(event) => setAmount(sanitizeAmount(event.target.value))} inputMode="decimal" placeholder="0.00" aria-label="ETH amount" />
                 <b>ETH</b>
               </div>
             </label>
 
             <div className="dialog-split">
-              <div><b>99%</b><span>{hasAmount ? `${splitAmount(amount, 0.99)} ETH` : "—"}<small>$401KEK ROUTE</small></span></div>
-              <div><b>1%</b><span>{hasAmount ? `${splitAmount(amount, 0.01)} ETH` : "—"}<small>QQQ ROUTE</small></span></div>
+              <div><b>99%</b><span>{hasAmount ? `${splitAmount(amount, 0.99)} ETH` : "-"}<small>$401KEK ROUTE</small></span></div>
+              <div><b>1%</b><span>{hasAmount ? `${splitAmount(amount, 0.01)} ETH` : "-"}<small>QQQ ROUTE</small></span></div>
             </div>
 
-            <button className="dialog-buy-button" type="button" onClick={buy} disabled={!canBuy || actionState === "working"}>
-              {actionState === "working" ? "OPENING WALLET…" : hasAmount ? "CONFIRM 99/1" : "ENTER AMOUNT"}
-              <Wallet size={23} weight="fill" />
-            </button>
+            {actionState === "success" && submittedHash ? (
+              <div className="dialog-receipt-success">
+                <div>
+                  <span>PENDING 99/1 RECEIPT</span>
+                  <strong>{shortAddress(submittedHash)}</strong>
+                  <small>MEMBER NUMBER PRINTS AFTER THE EVENT IS CONFIRMED AND INDEXED.</small>
+                </div>
+                <div>
+                  <button type="button" onClick={shareReceipt}><ShareNetwork size={19} weight="bold" /> SHARE RECEIPT</button>
+                  <a href={`${CHAIN.blockExplorerUrls[0]}/tx/${submittedHash}`} target="_blank" rel="noreferrer">VIEW ONCHAIN <ArrowRight size={18} weight="bold" /></a>
+                </div>
+              </div>
+            ) : (
+              <button className="dialog-buy-button" type="button" onClick={buy} disabled={!canBuy || actionState === "working"}>
+                {actionState === "working" ? "OPENING WALLET..." : hasAmount ? "CONFIRM 99/1" : "ENTER AMOUNT"}
+                <Wallet size={23} weight="fill" />
+              </button>
+            )}
             <p className={`dialog-message${actionState === "error" ? " action-error" : ""}`}>
               {actionMessage || "NO WALLET REQUEST UNTIL CONFIRM. BOTH LEGS OR NEITHER."}
             </p>
@@ -396,87 +388,18 @@ function HomePage() {
       )}
 
       <footer className="home-footer">
-        <div className="footer-slogan">
-          <span><b>99%</b> APE.</span>
-          <span><b>1%</b> ADULT.</span>
-        </div>
-        <a className="footer-proof" href="/proof">VIEW FORMULA →</a>
+        <div className="footer-slogan"><span><b>99%</b> APE.</span><span><b>1%</b> ADULT.</span></div>
+        <nav className="footer-links" aria-label="Project information">
+          {MARKET.marketReady && <a className="footer-proof" href="/flow">HOW IT WORKS</a>}
+          <a className="footer-proof" href="/code">VERIFY THE CODE</a>
+        </nav>
       </footer>
-    </div>
-  );
-}
-
-function FormulaRow({ label, children, accent = false }) {
-  return (
-    <div className={`formula-row${accent ? " formula-row-accent" : ""}`}>
-      <span>{label}</span>
-      <code>{children}</code>
-    </div>
-  );
-}
-
-function ProofPage() {
-  useEffect(() => {
-    document.title = "THE 99/1 FORMULA — DEGEN PENSION";
-  }, []);
-
-  return (
-    <div className="proof-page">
-      <header className="proof-header">
-        <Brand compact />
-        <a className="back-link" href="/"><ArrowLeft size={17} weight="bold" /> BACK TO BUY</a>
-      </header>
-
-      <main className="proof-main">
-        <section className="proof-intro">
-          <span className="proof-kicker">THE RECEIPT, NOT THE PITCH</span>
-          <h1>THE JOKE IS PUBLIC.<br /><em>THE SPLIT IS MATH.</em></h1>
-          <p>Fees come out first. The remainder is split once. Both swaps settle directly to the same recipient. If either leg fails, the transaction reverts.</p>
-        </section>
-
-        <section className="formula-sheet" aria-labelledby="formula-heading">
-          <div className="section-label"><Calculator size={23} weight="fill" /><span id="formula-heading">FEE-FIRST FORMULA</span></div>
-          <FormulaRow label="EXPLICIT FEE">fee = floor(gross × feeBps ÷ 10,000)</FormulaRow>
-          <FormulaRow label="NET INPUT">net = gross − fee</FormulaRow>
-          <FormulaRow label="MEME LEG" accent>memeIn = floor(net × 9,900 ÷ 10,000)</FormulaRow>
-          <FormulaRow label="STOCK LEG">stockIn = net − memeIn</FormulaRow>
-          <p className="formula-note">The stock leg receives the integer remainder, so rounding cannot leave input dust behind. 99/1 is the net input-budget allocation—not the output token quantity or post-trade value ratio. Gas is separate.</p>
-        </section>
-
-        <section className="member-proof">
-          <div className="section-label"><UsersThree size={23} weight="fill" /><span>WHAT “PENSION MEMBERS” MEANS</span></div>
-          <div className="member-equation">
-            <code>members = COUNT(UNIQUE SplitBuy.recipient)</code>
-            <strong>WHERE stockAmountOut &gt; 0</strong>
-          </div>
-          <p>We count unique recipients from the official Gateway’s successful <code>SplitBuy</code> events. We do not count every project-token holder, every QQQ holder, transfers, airdrops, or direct DEX buys.</p>
-        </section>
-
-        <section className="code-section" aria-labelledby="code-heading">
-          <div className="section-label"><Code size={23} weight="fill" /><span id="code-heading">SPLITBUYGATEWAY.SOL</span></div>
-          <div className="code-grid">
-            <article>
-              <div className="code-head"><span>01 · CALCULATE</span><b>9,900 / 100 BPS</b></div>
-              <pre><code>{CALCULATION_SOURCE}</code></pre>
-            </article>
-            <article>
-              <div className="code-head"><span>02 · SETTLE</span><b>ATOMIC</b></div>
-              <pre><code>{SETTLEMENT_SOURCE}</code></pre>
-            </article>
-          </div>
-        </section>
-
-        <section className="proof-truths">
-          <div><CheckCircle size={24} weight="fill" /><p><b>DIRECT</b> Both outputs are measured in and delivered to the recipient wallet.</p></div>
-          <div><CheckCircle size={24} weight="fill" /><p><b>ATOMIC</b> A revert on either adapter unwinds fee transfer, wrap, and both legs.</p></div>
-          <div><WarningCircle size={24} weight="fill" /><p><b>UNAUDITED MVP</b> Production adapters, quotes, addresses, and deployment still require verification.</p></div>
-        </section>
-      </main>
     </div>
   );
 }
 
 export function App() {
   const path = window.location.pathname.replace(/\/+$/, "") || "/";
-  return path === "/proof" ? <ProofPage /> : <HomePage />;
+  if (path === "/flow") return <FlowPage />;
+  return path === "/code" || path === "/proof" ? <CodePage /> : <HomePage />;
 }
