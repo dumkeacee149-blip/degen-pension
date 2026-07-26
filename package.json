@@ -8,9 +8,12 @@
     "dev": "vite",
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "preview": "vite preview",
+    "test:api": "node --test tests/api-*.test.mjs",
+    "test:launch": "node --test tests/launch-*.test.mjs",
     "test:sites": "node --test tests/sites-worker.test.mjs",
     "test:contracts": "cd contracts && forge test",
-    "verify": "npm run build && npm run test:sites && npm run test:contracts"
+    "generate:deploy": "node scripts/generate-deploy-artifacts.mjs",
+    "verify": "npm run build && npm run test:api && npm run test:launch && npm run test:sites && npm run test:contracts"
   },
   "dependencies": {
     "@fontsource/bebas-neue": "^5.3.0",
@@ -20,6 +23,7 @@
     "@vitejs/plugin-react": "5.0.4",
     "react": "19.2.0",
     "react-dom": "19.2.0",
+    "viem": "^2.33.2",
     "vite": "6.4.2"
   }
 }

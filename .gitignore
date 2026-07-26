@@ -6,3 +6,11 @@ contracts/cache/
 contracts/out/
 contracts/broadcast/
 *.log
+.vercel
+.launch-local/
+audit-current/
+audit-raccoon-fidelity/
+audit-user-perspective/
+audit-revision/*.png
+design-sources/generated/
+qa/

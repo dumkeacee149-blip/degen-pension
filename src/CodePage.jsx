@@ -1,13 +1,21 @@
 import { useEffect } from "react";
 import {
   ArrowLeft,
+  ArrowSquareOut,
   Calculator,
   CheckCircle,
   Code,
+  Coins,
+  ShieldCheck,
   UsersThree,
   Wallet,
   WarningCircle,
 } from "@phosphor-icons/react";
+import { STOCK_TOKEN } from "./config.js";
+import {
+  explorerAddress,
+  PRODUCTION_DEPLOYMENT,
+} from "./productionDeployment.js";
 import "./code-page.css";
 
 const CALCULATION_SOURCE = `function _calculateAmounts(uint256 grossAmountIn) private view returns (BuyAmounts memory amounts) {
@@ -36,81 +44,129 @@ const SETTLEMENT_SOURCE = `function _settleBuy(
         stockToken, stockAdapter, amounts.stockAmountIn, minStockOut, recipient
     );
 
-    _emitSplitBuy(recipient, grossAmountIn, amounts, projectAmountOut, stockAmountOut);
+    emit SplitBuy(
+        msg.sender,
+        recipient,
+        grossAmountIn,
+        amounts.explicitFeeAmount,
+        amounts.netAmountIn,
+        amounts.projectAmountIn,
+        amounts.stockAmountIn,
+        projectAmountOut,
+        stockAmountOut
+    );
 }`;
 
-const MEMBER_INDEX_SOURCE = `const recipients = new Set();
+const MEMBER_INDEX_SOURCE = `const runtime = await loadRuntime(config);
+if (!runtime.ready) throw new ApiError(503, "GATEWAY_NOT_CONFIGURED");
+
+const recipients = new Set();
 let buyCount = 0;
 
-for (let fromBlock = MARKET.activatedBlock; fromBlock <= safeBlock; fromBlock += LOG_BLOCK_CHUNK) {
+for (let fromBlock = BigInt(runtime.activatedBlock); fromBlock <= safeBlock; fromBlock += chunk) {
   const toBlock = Math.min(fromBlock + LOG_BLOCK_CHUNK - 1, safeBlock);
-  const logs = await rpc(
-    "eth_getLogs",
-    [{
-      address: MARKET.gatewayAddress,
-      fromBlock: toHex(fromBlock),
-      toBlock: toHex(toBlock),
-      topics: [SPLIT_BUY_TOPIC],
-    }],
-    signal,
-  );
+  const logs = await client.getLogs({
+    address: runtime.gatewayAddress,
+    event: SPLIT_BUY_EVENT,
+    fromBlock,
+    toBlock,
+    strict: true,
+  });
 
   for (const log of logs) {
-    const recipientTopic = log.topics?.[2];
-    const stockAmountOutWord = log.data?.slice(-64);
-    if (!recipientTopic || !stockAmountOutWord) continue;
-    if (BigInt(\`0x\${stockAmountOutWord}\`) === 0n) continue;
-    recipients.add(\`0x\${recipientTopic.slice(-40)}\`.toLowerCase());
+    if (!log.args.recipient || log.args.stockAmountOut <= 0n) continue;
+    recipients.add(log.args.recipient.toLowerCase());
     buyCount += 1;
   }
 }`;
 
-const BUY_CALL_SOURCE = `const quoteResponse = await fetch(MARKET.buyQuoteEndpoint, {
-  method: "POST",
-  headers: { "content-type": "application/json", accept: "application/json" },
-  body: JSON.stringify({ amountEth: amount, recipient: wallet, chainId: CHAIN.chainIdDecimal }),
+const BUY_CALL_SOURCE = `const executableQuote = await requestAndValidateQuote({
+  market: MARKET,
+  chain: CHAIN,
+  wallet,
+  amountEth: amount,
+  runtime: liveRuntime,
+  termsAccepted: true,
+  notUSPerson: true,
 });
-if (!quoteResponse.ok) throw new Error(\`Quote failed (\${quoteResponse.status}).\`);
-
-const quotePayload = await quoteResponse.json();
-const transaction = quotePayload.transaction || quotePayload;
-if (String(transaction.to || "").toLowerCase() !== MARKET.gatewayAddress.toLowerCase()) {
-  throw new Error("Quote target does not match the official Gateway.");
-}
-if (!transaction.data || !transaction.value) {
-  throw new Error("Quote did not include a complete transaction.");
-}
 
 const transactionHash = await window.ethereum.request({
   method: "eth_sendTransaction",
   params: [{
     from: wallet,
-    to: transaction.to,
-    data: transaction.data,
-    value: transaction.value,
+    to: executableQuote.transaction.to,
+    data: executableQuote.transaction.data,
+    value: executableQuote.transaction.value,
   }],
 });`;
+
+const ACTIVATION_SOURCE = `function createMarket(
+    AdoptMarketV2 calldata adoption,
+    bytes calldata signature
+) external returns (address market) {
+    if (block.timestamp > adoption.deadline) revert AuthorizationExpired(adoption.deadline);
+    if (usedNonces[adoption.nonce]) revert NonceAlreadyUsed(adoption.nonce);
+
+    bytes32 digest = _hashAdoptMarket(adoption);
+    if (!projectAuthority.isValidSignatureNow(digest, signature)) {
+        revert InvalidProjectAuthoritySignature();
+    }
+    usedNonces[adoption.nonce] = true;
+
+    market = address(implementation).clone();
+    SplitBuyGatewayV2(market).initialize(
+        adoption.officialToken,
+        adoption.stockToken,
+        adoption.projectAdapter,
+        adoption.stockAdapter,
+        adoption.explicitFeeBps,
+        adoption.feeRecipient,
+        adoption.guardian,
+        adoption.eligibilityChecker,
+        adoption.maxAmountIn
+    );
+    isMarket[market] = true;
+}`;
+
+const QQQ_DELIVERY_SOURCE = `function _executeLeg(
+    address output,
+    address adapter,
+    uint256 amountIn,
+    uint256 minimumOut,
+    address recipient
+) private returns (uint256 amountOut) {
+    uint256 balanceBefore = IERC20(output).balanceOf(recipient);
+    IERC20(inputToken).safeTransfer(adapter, amountIn);
+    uint256 reportedOut = ISwapAdapter(adapter).swapExactInput(
+        amountIn, minimumOut, recipient
+    );
+    amountOut = IERC20(output).balanceOf(recipient) - balanceBefore;
+
+    if (amountOut < minimumOut || amountOut != reportedOut) {
+        revert InvalidAdapterOutput(adapter, reportedOut, amountOut, minimumOut);
+    }
+}`;
 
 const CODE_BLOCKS = [
   {
     number: "01",
     title: "FEE-FIRST SPLIT",
     tag: "9,900 / 100 BPS",
-    source: "contracts/src/SplitBuyGateway.sol",
+    source: "contracts/src/SplitBuyGatewayV2.sol",
     code: CALCULATION_SOURCE,
   },
   {
     number: "02",
     title: "ATOMIC SETTLEMENT",
     tag: "BOTH OR NEITHER",
-    source: "contracts/src/SplitBuyGateway.sol",
+    source: "contracts/src/SplitBuyGatewayV2.sol",
     code: SETTLEMENT_SOURCE,
   },
   {
     number: "03",
     title: "COUNT MEMBERS",
     tag: "CANONICAL EVENTS",
-    source: "src/memberStats.js",
+    source: "server/stats.js",
     code: MEMBER_INDEX_SOURCE,
   },
   {
@@ -119,6 +175,13 @@ const CODE_BLOCKS = [
     tag: "OFFICIAL GATEWAY",
     source: "src/App.jsx",
     code: BUY_CALL_SOURCE,
+  },
+  {
+    number: "05",
+    title: "AUTHORIZED ADOPTION",
+    tag: "SIGNED + NONCED",
+    source: "contracts/src/MarketFactoryV2.sol",
+    code: ACTIVATION_SOURCE,
   },
 ];
 
@@ -134,7 +197,7 @@ function FormulaRow({ label, children, accent = false }) {
 function CodeBrand() {
   return (
     <a className="code-page-brand" href="/" aria-label="Degen Pension home">
-      <img src="/brand/mark-99-1-v2.png" alt="" />
+      <img src="/brand/mark-99-1-v2.webp" alt="" />
       <span>DEGEN PENSION</span>
       <b>401KEK</b>
     </a>
@@ -148,27 +211,103 @@ export function CodePage() {
 
   return (
     <div className="project-code-page">
+      <a className="code-page-skip-link" href="#code-page-main">SKIP TO CODE</a>
       <header className="code-page-header">
         <CodeBrand />
         <div className="code-page-header-actions">
           <span className="code-page-risk"><WarningCircle size={16} weight="fill" /> UNAUDITED MVP</span>
           <a className="code-page-back" href="/flow">HOW IT WORKS</a>
-          <a className="code-page-back" href="/"><ArrowLeft size={17} weight="bold" /> BACK TO BUY</a>
+          <a className="code-page-back" href="/"><ArrowLeft size={17} weight="bold" /> BACK TO HOME</a>
         </div>
       </header>
 
-      <main className="code-page-main">
+      <main className="code-page-main" id="code-page-main" tabIndex={-1}>
         <section className="code-page-intro">
-          <span className="code-page-kicker">PUBLIC LOGIC · REAL RUNTIME PATHS</span>
+          <span className="code-page-kicker">PUBLIC LOGIC · IMPLEMENTED + TESTED PATHS</span>
           <h1>THE MEME IS LOUD.<br /><em>THE CODE IS PUBLIC.</em></h1>
           <div className="code-page-intro-copy">
             <p>These source-matched excerpts are formatted for this page without changing the expressions or calls that calculate the split, execute both legs, count public members, and submit the official Gateway transaction.</p>
             <nav aria-label="Runtime code sections">
+              <a href="#qqq-delivery"><b>QQQ</b>DELIVERY READINESS</a>
               {CODE_BLOCKS.map((block) => (
                 <a key={block.number} href={`#runtime-${block.number}`}><b>{block.number}</b>{block.title}</a>
               ))}
             </nav>
           </div>
+        </section>
+
+        <section className="code-page-deployment" id="deployment-proof" aria-labelledby="deployment-proof-heading">
+          <div className="code-page-section-label">
+            <ShieldCheck size={23} weight="fill" />
+            <span id="deployment-proof-heading">FOUNDATION CONTRACTS · ONCHAIN RECORD</span>
+          </div>
+          <div className="code-page-deployment-status">
+            <div><b>FOUNDATION</b><strong>VERIFIED</strong></div>
+            <p>
+              MarketFactory and its locked SplitBuyGateway implementation are deployed and
+              source-verified. This is foundation proof only: there is no adopted official
+              token, active market or executable buy route.
+            </p>
+          </div>
+          <dl className="code-page-deployment-grid">
+            <div>
+              <dt>MARKETFACTORY</dt>
+              <dd>{PRODUCTION_DEPLOYMENT.marketFactoryAddress}</dd>
+              <a href={explorerAddress(PRODUCTION_DEPLOYMENT.marketFactoryAddress)} target="_blank" rel="noreferrer">SOURCE VERIFIED <ArrowSquareOut weight="bold" /></a>
+            </div>
+            <div>
+              <dt>LOCKED GATEWAY IMPLEMENTATION</dt>
+              <dd>{PRODUCTION_DEPLOYMENT.gatewayImplementationAddress}</dd>
+              <a href={explorerAddress(PRODUCTION_DEPLOYMENT.gatewayImplementationAddress)} target="_blank" rel="noreferrer">SOURCE VERIFIED <ArrowSquareOut weight="bold" /></a>
+            </div>
+            <div>
+              <dt>IMMUTABLE PROJECT AUTHORITY</dt>
+              <dd>{PRODUCTION_DEPLOYMENT.projectAuthority}</dd>
+              <a href={explorerAddress(PRODUCTION_DEPLOYMENT.projectAuthority)} target="_blank" rel="noreferrer">READ ONCHAIN <ArrowSquareOut weight="bold" /></a>
+            </div>
+            <div>
+              <dt>ADOPTED MARKET</dt>
+              <dd>NOT ACTIVE</dd>
+              <span>NO OFFICIAL CA · NO MARKET CLONE</span>
+            </div>
+          </dl>
+          <div className="code-page-hash">
+            <span>RUNTIME GATE</span>
+            <code>PRE-LAUNCH · MARKET NOT ACTIVE · BUYING DISABLED</code>
+          </div>
+        </section>
+
+        <section className="code-page-qqq" id="qqq-delivery" aria-labelledby="qqq-delivery-heading">
+          <div className="code-page-section-label">
+            <Coins size={23} weight="fill" />
+            <span id="qqq-delivery-heading">QQQ DELIVERY · WHAT EXISTS / WHAT IS MISSING</span>
+          </div>
+          <div className="code-page-qqq-summary">
+            <div>
+              <span>STOCK LEG TARGET</span>
+              <strong>ROBINHOOD QQQ</strong>
+              <div className="code-page-qqq-links">
+                <a href={STOCK_TOKEN.registryUrl} target="_blank" rel="noreferrer">OFFICIAL ASSET REGISTRY <ArrowSquareOut weight="bold" /></a>
+              </div>
+            </div>
+            <div>
+              <span>DELIVERY MODEL</span>
+              <strong>BOUGHT, NOT AIRDROPPED.</strong>
+              <p>The Gateway implementation requires the 1% stock leg to reach the buyer in the same transaction. A future adopted market must bind a real deployed adapter and executable QQQ liquidity route. Neither is production-deployed today.</p>
+            </div>
+          </div>
+          <div className="code-page-qqq-detail">
+            <pre aria-label="QQQ direct-delivery contract code"><code>{QQQ_DELIVERY_SOURCE}</code></pre>
+            <div className="code-page-readiness" aria-label="QQQ production readiness">
+              <div className="is-registered"><b>REGISTRY LIVE</b><p>Canonical Robinhood QQQ CA is identified by the chain-4663 asset registry.</p></div>
+              <div className="is-implemented"><b>IMPLEMENTED · TESTED</b><p>Gateway measures the recipient&apos;s output-token balance delta after each adapter call.</p></div>
+              <div className="is-implemented"><b>IMPLEMENTED · TESTED</b><p>Missing output, slippage failure or adapter mismatch reverts both 99% and 1% legs.</p></div>
+              <div className="is-not-deployed"><b>NOT DEPLOYED</b><p>No production QQQ adapter or executable WETH → USDG → QQQ liquidity route is bound.</p></div>
+              <div className="is-pending"><b>PENDING</b><p>The official project token and its authority-approved project adapter have not been adopted.</p></div>
+              <div className="is-not-deployed"><b>NOT DEPLOYED</b><p>Executable quote, Gateway simulation and eligibility services are not production-deployed.</p></div>
+            </div>
+          </div>
+          <p className="code-page-qqq-note">Production readiness requires a signed market adoption that binds the official CA, a real project adapter, a real QQQ adapter, executable liquidity, quote simulation and eligibility controls. Until all of them exist and pass live checks, the site must not return a sendable buy transaction.</p>
         </section>
 
         <section className="code-page-formula" aria-labelledby="code-formula-heading">
@@ -198,7 +337,7 @@ export function CodePage() {
         <section className="code-page-runtime" aria-labelledby="code-runtime-heading">
           <div className="code-page-section-label">
             <Code size={23} weight="fill" />
-            <span id="code-runtime-heading">THE FOUR RUNTIME PATHS</span>
+            <span id="code-runtime-heading">FIVE IMPLEMENTED CODE PATHS</span>
           </div>
           <div className="code-page-grid">
             {CODE_BLOCKS.map((block) => (
@@ -214,17 +353,17 @@ export function CodePage() {
           </div>
         </section>
 
-        <section className="code-page-truths" aria-label="Runtime guarantees and limitations">
-          <div><CheckCircle size={25} weight="fill" /><p><b>DIRECT</b>Both output-token balances are measured at and delivered to the recipient.</p></div>
-          <div><CheckCircle size={25} weight="fill" /><p><b>ATOMIC</b>If the fee transfer or either adapter call reverts, the whole transaction unwinds.</p></div>
+        <section className="code-page-truths" aria-label="Implemented guarantees and production limitations">
+          <div><CheckCircle size={25} weight="fill" /><p><b>DIRECT · TESTED</b>The Gateway implementation measures both output-token balance changes at the recipient.</p></div>
+          <div><CheckCircle size={25} weight="fill" /><p><b>ATOMIC · TESTED</b>The Gateway implementation unwinds the transaction if the fee transfer or either adapter call reverts.</p></div>
           <div><Wallet size={25} weight="fill" /><p><b>DEFERRED WALLET</b>The homepage asks for a wallet only after the buyer confirms an amount.</p></div>
-          <div className="code-page-warning"><WarningCircle size={25} weight="fill" /><p><b>UNAUDITED MVP</b>Addresses, adapters, quote service, slippage, and deployment require production verification.</p></div>
+          <div className="code-page-warning"><WarningCircle size={25} weight="fill" /><p><b>UNAUDITED</b>Tests and a real-chain fork are not a substitute for an independent security review. Regional IP gating and user attestation are technical controls, not legal advice or identity-level KYC.</p></div>
         </section>
       </main>
 
       <footer className="code-page-footer">
         <span><b>99%</b> APE. <b>1%</b> ADULT.</span>
-        <nav aria-label="Code page footer links"><a href="/flow">HOW IT WORKS</a><a href="/"><ArrowLeft size={16} weight="bold" /> RETURN TO BUY</a></nav>
+        <nav aria-label="Code page footer links"><a href="/flow">HOW IT WORKS</a><a href="/"><ArrowLeft size={16} weight="bold" /> RETURN HOME</a></nav>
       </footer>
     </div>
   );

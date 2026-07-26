@@ -11,40 +11,40 @@ import {
   ShoppingCart,
   UsersThree,
 } from "@phosphor-icons/react";
-import { MARKET } from "./config.js";
 import { useMemberStats } from "./useMemberStats.js";
+import { useRuntimeReadiness } from "./useRuntimeReadiness.js";
 import "./flow-page.css";
 
 const THREE_BEATS = [
   {
     title: "BUY THE MEME",
     Icon: ShoppingCart,
-    copy: "Choose one amount on the official 99/1 route. The wallet stays closed until you confirm.",
+    copy: "When the official market opens, choose one amount on the 99/1 route. The wallet stays closed until you confirm.",
   },
   {
     title: "1% GOES ADULT",
     Icon: Coins,
-    copy: "After the disclosed fee, 99% buys $401KEK and 1% buys canonical QQQ in the same transaction.",
+    copy: "On the active route, the post-fee net amount will buy 99% $401KEK and 1% canonical QQQ atomically.",
   },
   {
     title: "PRINT THE RECEIPT",
     Icon: Receipt,
-    copy: "Both assets land in your wallet. The SplitBuy event unlocks member status and a shareable retirement receipt.",
+    copy: "Only a confirmed official SplitBuy event will unlock member status and a shareable retirement receipt.",
   },
 ];
 
 function FlowBrand() {
   return (
     <a className="flow-brand" href="/" aria-label="Degen Pension home">
-      <img src="/brand/mark-99-1-v2.png" alt="" />
+      <img src="/brand/mark-99-1-v2.webp" alt="" />
       <span>DEGEN PENSION</span>
       <b>401KEK</b>
     </a>
   );
 }
 
-function memberCopy(stats) {
-  if (!MARKET.marketReady || stats.status === "prelaunch") {
+function memberCopy(stats, marketReady) {
+  if (!marketReady || stats.status === "prelaunch") {
     return { number: "—", label: "OFFICIAL MEMBERS", line: "FIRST QUALIFYING BUY OPENS THE RECEIPT WALL" };
   }
   if (stats.status === "loading") {
@@ -62,8 +62,10 @@ function memberCopy(stats) {
 }
 
 export function FlowPage() {
-  const stats = useMemberStats();
-  const members = memberCopy(stats);
+  const runtime = useRuntimeReadiness();
+  const stats = useMemberStats(runtime);
+  const members = memberCopy(stats, runtime.ready);
+  const marketActive = runtime.ready === true;
   const [shareLabel, setShareLabel] = useState("SHARE THE PLAN");
 
   useEffect(() => {
@@ -71,7 +73,9 @@ export function FlowPage() {
   }, []);
 
   const sharePlan = async () => {
-    const text = "I found a retirement plan for people who buy meme coins: 99% $401KEK, 1% QQQ. 99% APE. 1% ADULT.";
+    const text = marketActive
+      ? "I found a retirement plan for people who buy meme coins: 99% $401KEK, 1% QQQ. 99% APE. 1% ADULT."
+      : "A pre-launch 99/1 split-buy idea: 99% $401KEK, 1% QQQ. Market not active. 99% APE. 1% ADULT.";
     try {
       if (navigator.share) {
         await navigator.share({ title: "DEGEN PENSION", text, url: window.location.origin });
@@ -88,6 +92,7 @@ export function FlowPage() {
 
   return (
     <div className="flow-page">
+      <a className="flow-skip-link" href="#flow-main">SKIP TO HOW IT WORKS</a>
       <header className="flow-header">
         <FlowBrand />
         <nav className="flow-header-actions" aria-label="Project page links">
@@ -96,26 +101,34 @@ export function FlowPage() {
         </nav>
       </header>
 
-      <main className="flow-main">
+      <main className="flow-main" id="flow-main" tabIndex="-1">
         <section className="flow-hero">
           <div className="flow-hero-copy">
+            <div className={`flow-market-state ${marketActive ? "is-active" : "is-prelaunch"}`} role="status">
+              <span>{marketActive ? "OFFICIAL 99/1 ROUTE" : "PRE-LAUNCH PROTOTYPE"}</span>
+              <strong>{marketActive ? "RUNTIME CHECKS PASSED" : "MARKET NOT ACTIVE"}</strong>
+            </div>
             <span className="flow-kicker">THE RETIREMENT PLAN YOUR GROUP CHAT DESERVES</span>
             <h1>BUY THE MEME.<br /><em>MAKE 1% GROW UP.</em></h1>
-            <p>One click buys $401KEK and QQQ together, then prints proof that your wallet joined the worst pension club online.</p>
+            <p>{marketActive
+              ? "The official route buys $401KEK and QQQ together, then prints proof that your wallet joined the worst pension club online."
+              : "This page explains the intended 99/1 route. Trading is not active: no wallet, quote, or transaction runs here until the official market opens."}</p>
             <div className="flow-hero-actions">
-              <a className="flow-primary" href="/">OPEN 99/1 <ArrowRight size={20} weight="bold" /></a>
+              <a className="flow-primary" href="/">{marketActive ? "OPEN 99/1" : "RETURN TO PROJECT"} <ArrowRight size={20} weight="bold" /></a>
               <button className="flow-secondary" type="button" onClick={sharePlan}><ShareNetwork size={18} weight="bold" />{shareLabel}</button>
             </div>
           </div>
           <div className="flow-hero-art">
-            <img src="/assets/raccoon-deadpan-v2.png" alt="A tired deadpan cartoon raccoon in a cheap suit and green tie holding an empty coffee cup" />
+            <img src="/assets/raccoon-deadpan-v2.webp" alt="A tired deadpan cartoon raccoon in a cheap suit and green tie holding an empty coffee cup" />
           </div>
         </section>
 
         <section className="three-beat" aria-labelledby="three-beat-heading">
           <header>
             <h2 id="three-beat-heading">THE WHOLE TRICK IN THREE BEATS.</h2>
-            <p>No wallet on arrival. No mystery pool. No separate claim.</p>
+            <p>{marketActive
+              ? "No wallet on arrival. No mystery pool. No separate claim."
+              : "INTENDED FLOW ONLY · NO ACTIVE MARKET · NO TRANSACTION ON THIS PAGE"}</p>
           </header>
           <div className="beat-grid">
             {THREE_BEATS.map(({ title, Icon, copy }, index) => (
@@ -134,12 +147,12 @@ export function FlowPage() {
             <span>“WHY NOT JUST BUY BOTH MYSELF?”</span>
             <h2>YOU CAN.<br />YOU WON’T GET <em>THE RECEIPT.</em></h2>
           </div>
-          <p>99/1 is not pretending to invent QQQ. The product is one atomic route plus public proof: member order, receipt art, and a place on the official pension wall.</p>
+          <p>99/1 is not pretending to invent QQQ. The intended product is one atomic route plus public proof: member order, receipt art, and a place on the official pension wall after a confirmed qualifying buy.</p>
         </section>
 
         <section className="receipt-section" id="receipt" aria-labelledby="receipt-heading">
           <div className="receipt-character">
-            <img src="/assets/raccoon-deadpan-v2.png" alt="A tired deadpan cartoon raccoon in a cheap suit and green tie holding an empty coffee cup" />
+            <img src="/assets/raccoon-deadpan-v2.webp" alt="A tired deadpan cartoon raccoon in a cheap suit and green tie holding an empty coffee cup" />
             <p>THE RACCOON CHANGES JOB TITLE AS THE MEMBER WALL GROWS.</p>
           </div>
           <div className="receipt-copy">
@@ -147,10 +160,12 @@ export function FlowPage() {
             <p>A successful official buy unlocks a social object that is tied to the canonical SplitBuy event, not a screenshot anyone can fake.</p>
             <div className="receipt-preview" aria-label="Retirement receipt preview">
               <header><span>DEGEN PENSION</span><b>OFFICIAL 99/1 RECEIPT</b></header>
-              <div className="receipt-number"><small>MEMBER NUMBER</small><strong>{members.number}</strong></div>
+              {marketActive && (
+                <div className="receipt-number"><small>MEMBER NUMBER</small><strong>{members.number}</strong></div>
+              )}
               <div className="receipt-assets">
-                <span><img src="/assets/badge-401kek-v1.png" alt="401KEK badge" /><b>99% MEME</b></span>
-                <span><img src="/assets/badge-qqq-v1.png" alt="QQQ badge" /><b>1% ADULT</b></span>
+                <span><img src="/assets/badge-401kek-v1.webp" alt="401KEK badge" /><b>99% MEME</b></span>
+                <span><img src="/assets/badge-qqq-v1.webp" alt="QQQ badge" /><b>1% ADULT</b></span>
               </div>
               <footer><span>SOURCE</span><b>CANONICAL SPLITBUY EVENT</b></footer>
             </div>
@@ -187,16 +202,18 @@ export function FlowPage() {
           </details>
         </section>
 
-        <section className="receipt-wall">
-          <div className="wall-count">
-            <span>{members.label}</span>
-            <strong>{members.number}</strong>
-          </div>
+        <section className={`receipt-wall ${marketActive ? "" : "receipt-wall-prelaunch"}`}>
+          {marketActive && (
+            <div className="wall-count">
+              <span>{members.label}</span>
+              <strong>{members.number}</strong>
+            </div>
+          )}
           <div>
-            <h2>{MARKET.marketReady ? "THE WALL IS ONCHAIN." : "THE FIRST FRAME IS EMPTY."}</h2>
-            <p>{MARKET.marketReady ? "Every number is backed by a unique recipient in confirmed official SplitBuy events." : "No fake avatars and no invented volume. The first verified receipt prints when the official route opens."}</p>
+            <h2>{marketActive ? "THE WALL IS ONCHAIN." : "THE WALL OPENS WITH THE MARKET."}</h2>
+            <p>{marketActive ? "Every number is backed by a unique recipient in confirmed official SplitBuy events." : "No placeholder count, fake avatars, or invented volume. The first member number appears only after a confirmed official SplitBuy event."}</p>
           </div>
-          <a href="/">{MARKET.marketReady ? "BUY 99/1" : "CLAIM IT AT LAUNCH"}<ArrowRight size={20} weight="bold" /></a>
+          <a href="/">{marketActive ? "BUY 99/1" : "RETURN HOME"}<ArrowRight size={20} weight="bold" /></a>
         </section>
       </main>
 

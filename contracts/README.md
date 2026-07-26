@@ -1,42 +1,94 @@
-# DEGEN PENSION 99/1 contracts MVP
+# DEGEN PENSION 99/1 production contracts
 
-This directory contains a Foundry MVP for an authority-adopted, atomic split-buy market.
+The active design is Production V2. A single `ProductionMarketActivator`
+predeploys every CA-independent component on Robinhood Chain mainnet:
 
-## Official market adoption
+- a locked `SplitBuyGatewayV2` implementation;
+- a canonical `RobinhoodQqqAdapter` fixed to
+  WETH → USDG (100) → QQQ (3000);
+- a `PonsProjectAdapterFactory` fixed to the active Pons factory and the
+  WETH/project-token 1% Uniswap V3 tier;
+- a `SignedEligibilityVerifier` whose signer/policy can only be rotated by the
+  fixed project authority; and
+- fixed launch operator, guardian and maximum single input.
 
-`MarketFactory` has one immutable `projectAuthority`. A market can only be created with a valid EIP-712 `AdoptMarket` authorization from that authority. The authorization binds:
+The earlier `MarketFactory` contracts remain in the repository as V1 history.
+They are not the production launch path.
 
-- the chain ID and factory address through the EIP-712 domain;
-- the official token and Stock Token;
-- both fixed swap adapters;
-- the explicit fee rate and recipient; and
-- a one-time nonce and deadline.
+## Settlement
 
-This lets any relayer deploy the market without making the relayer or token deployer the project authority. A nonce cannot be replayed, an expired authorization fails, and a signature for one factory or chain cannot authorize another. The factory deploys an EIP-1167 clone and initializes it in the same transaction.
+For each Gateway buy:
 
-## Fee-first 99/1 settlement
+1. `fee = floor(gross × explicitFeeBps / 10,000)`;
+2. `net = gross - fee`;
+3. `projectIn = floor(net × 9,900 / 10,000)`;
+4. `stockIn = net - projectIn`;
+5. the project adapter buys the official token directly to `recipient`; and
+6. the QQQ adapter buys canonical QQQ directly to the same `recipient`.
 
-Each market permanently binds its input token, output tokens, adapters, `explicitFeeBps`, and `feeRecipient`. A buy:
+The production activator initializes the Gateway with `explicitFeeBps = 0`, so
+the AMM/launch-platform swap fees are reflected in route output without a second
+project charge. Both recipient balance deltas must equal the adapters' reported
+outputs and exceed the user's minimums. Any failure reverts wrapping, both swaps,
+and every transfer.
 
-1. receives the gross input;
-2. transfers the explicit platform fee;
-3. sends 99% of the remaining net input through the project-token adapter; and
-4. sends the remaining 1%, including integer rounding dust, through the Stock Token adapter.
+## Before the CA exists
 
-For a gross input of `10,000` and a 1% explicit fee, the fee is `100`, net input is `9,900`, the project-token leg receives `9,801`, and the Stock Token leg receives `99`.
+Set the fixed public values from `.env.deploy.example`, keep signing material in
+encrypted wallets/server secrets, and deploy:
 
-The explicit fee is capped at 500 bps. A zero fee permits a zero fee recipient. If the production AMM or adapter already embeds its own swap fee in the quote/output, initialize `explicitFeeBps` to zero to avoid charging users twice.
+```sh
+forge script script/DeployProduction.s.sol:DeployProduction \
+  --rpc-url "$RH_RPC_URL" \
+  --account degen-pension-deployer \
+  --broadcast
+```
 
-Both adapters must deliver their configured output directly to the requested recipient. The gateway verifies the recipient's real balance increase against the adapter's reported output and the user's minimum. A failure or invalid output on either leg reverts the fee, both legs, and the full transaction.
+Verify every immutable binding without broadcasting:
 
-`buy` accepts the bound ERC-20 input. `buyNative` wraps all `msg.value` and runs the same settlement, so it is usable only when the bound input implements the WETH `deposit()` interface.
+```sh
+forge script script/VerifyProduction.s.sol:VerifyProduction \
+  --rpc-url "$RH_RPC_URL"
+```
 
-The implementation has no owner, upgrade hook, generic call function, ratio setter, fee setter, or reinitializer. The implementation contract locks its own initializer in its constructor; factory clones are initialized atomically.
+The fixed `PROJECT_AUTHORITY` then sends the one-way authorization transaction:
 
-Run the tests:
+```sh
+forge script script/AuthorizeLaunchOperator.s.sol:AuthorizeLaunchOperator \
+  --rpc-url "$RH_RPC_URL" \
+  --account degen-pension-authority \
+  --broadcast
+```
+
+## Launch day: one variable
+
+After Pons has created the official token and canonical 1% WETH pool, set only
+`OFFICIAL_TOKEN_ADDRESS` and run:
+
+```sh
+forge script script/ActivatePonsMarket.s.sol:ActivatePonsMarket \
+  --rpc-url "$RH_RPC_URL" \
+  --account degen-pension-deployer \
+  --broadcast
+```
+
+`activatePonsMarket(CA)` rejects a fake/unregistered CA, a non-WETH pair, a
+different fee tier, a mismatched token pool, a second activation, an unauthorized
+operator, or a missing pre-authorization. For a valid CA it creates the immutable
+project adapter, initializes a Gateway clone, registers it and unpauses it in the
+same transaction.
+
+## Verification
 
 ```sh
 forge test
+RUN_FORK_TESTS=true forge test --match-contract ProductionForkTest -vv
+forge build --sizes --skip script
 ```
 
-This is an unaudited MVP. The mock tokens and adapters are test fixtures, not production swap integrations. No mainnet deployment is included.
+The fork test uses a real active Pons token and the live canonical QQQ route. It
+executes an atomic native buy and asserts that both assets reach the user directly.
+
+These contracts are tested but unaudited. Fork success is not a substitute for
+an independent smart-contract audit, operations monitoring, or jurisdictional
+review of Stock Token distribution.

@@ -23,13 +23,13 @@ npm run test:contracts
 npm run verify
 ```
 
-## Demo 边界
+## 生产边界
 
-当前仓库用于演示产品体验和发布流程，不应被视为已上线的交易、经纪、养老或投资建议服务。
+当前仓库包含真实生产交易链路，但市场在链上 Registry 完成 CA 激活前始终失败闭锁。它不是经纪、养老或投资建议服务。
 
-- 页面中的余额、价格、输出数量、状态和角色文案可能是演示数据。
-- 除非运行环境明确配置并验证，否则 Demo 不执行真实兑换、不验证用户司法辖区、不发布社交媒体内容，也不代表任何第三方协议或发行方背书。
-- 文档不提供未经验证的项目 CA、Gateway 地址或 Stock Token 地址。生产发布必须从受控配置和链上校验结果读取地址。
+- 页面不展示伪造余额、价格、输出数量、人数或成交状态。未激活时只显示 `PENDING`/blocked。
+- CA、Gateway、Adapter、路径和激活区块不编译进生产页面，全部从链上 `ProductionMarketActivator` 读取并复核。
+- 报价服务调用真实 Quoter V2，应用滑点下限，签发短时资格证明，再用完整 Gateway calldata、真实 payer/value 执行 `eth_call`；任一步失败都不返回可发送交易。
 - Stock Token 的可用性取决于资产状态、流动性、价格源和用户资格；不满足任一条件时，Gateway 应失败闭锁。
 - 不承诺价格、收益、流动性、成交、退休保障或本金安全。
 
@@ -37,17 +37,20 @@ npm run verify
 
 ## 网站数据口径
 
-首页不在加载时请求钱包权限。`PENSION MEMBERS` 通过 Robinhood Chain 只读 RPC 统计 canonical Gateway 的 `SplitBuy` 日志：筛选 `stockAmountOut > 0` 后，按 `recipient` 去重。它表示历史上经官方 99/1 路径实际收到过 QQQ 的唯一地址数，不等于真人数、项目币 holder 数或 QQQ 的全链 holder 数。
+首页不在加载时请求钱包权限。首页角色阶段读取官方代币的 Blockscout holder 数；收据墙的 `PENSION MEMBERS` 则通过服务端只读 RPC 统计 canonical Gateway 的 `SplitBuy` 日志：筛选 `stockAmountOut > 0` 后，按 `recipient` 去重。两者口径明确分离。
 
-首页不预填或展示任意 ETH 金额。市场上线后，点击 `BUY 99/1` 才打开金额层；只有用户填写金额并确认后才请求钱包连接。上线配置参考 [`.env.example`](.env.example)；CA 或 Gateway 未配置时，页面保持 `CA LOADING`，不展示伪造人数，也不会请求交易。
+首页不预填或展示任意 ETH 金额。市场上线后，点击 `BUY 99/1` 才打开金额层；只有用户填写金额、接受条款并确认后才请求钱包连接。上线配置参考 [`.env.example`](.env.example)；Registry 未激活时页面保持 `CA: PENDING`，不展示伪造人数，也不会请求交易。
 
-运转公式和对应 Solidity 代码展示在独立的 `/proof` 页面。
+项目真实运行路径展示在独立的 `/code` 页面：包括 fee-first 99/1 计算、原子双腿结算、成员事件统计，以及前端 quote 校验与交易提交。旧的 `/proof` 地址保留为兼容入口。
 
-CA 出现后的自动化操作见 [`ops/README.md`](ops/README.md)。操作脚本默认只做签名与 `eth_call` 演练，只有显式传入 `--broadcast` 才会发送交易；仓库内不保存裸私钥或助记词。
+对外项目介绍与用户工作流程展示在 `/flow` 页面：覆盖产品是什么、每笔 99/1 买入如何完成、资金如何分流、用户收到什么、成交后资产如何变化，以及哪些行为不属于官方 99/1 买入。
+
+CA 出现后的唯一变量交易是 `activatePonsMarket(officialCA)`；Foundry 脚本见 [`contracts/script/ActivatePonsMarket.s.sol`](contracts/script/ActivatePonsMarket.s.sol)。仓库内不保存裸私钥或助记词。
 
 ## 传播资产
 
 - `public/brand/mark-99-1.png`：512×512 品牌图标。
+- `public/assets/badge-401kek-v1.png` 与 `public/assets/badge-qqq-v1.png`：买入预览中的透明圆章资产。
 - `public/brand/wordmark.png`：1200×400 横版品牌锁定组合。
 - `public/social/og-99-1.png`：1600×900 产品主视觉 / Open Graph 图。
 - `public/social/ca-loading.png`：1080×1080，CA 未确认阶段使用，明确提醒不要买仿盘。
@@ -59,8 +62,7 @@ CA 出现后的自动化操作见 [`ops/README.md`](ops/README.md)。操作脚�
 .
 ├── src/                    # React 产品界面
 ├── public/                 # 角色插画与社交传播资产
-├── contracts/              # 未审计 Foundry 合约 MVP
-├── ops/                    # 150 秒失败闭锁上线脚本
+├── contracts/              # 未审计 Foundry 生产 V2 合约与真实链分叉测试
 ├── docs/                   # 产品、发布和品牌规范
 ├── worker/                 # Sites 运行时入口
 ├── scripts/                # 构建与交付脚本
@@ -71,4 +73,4 @@ CA 出现后的自动化操作见 [`ops/README.md`](ops/README.md)。操作脚�
 └── vite.config.mjs         # Vite 配置
 ```
 
-`contracts/` 已包含可运行测试的链上 MVP，但尚未审计、尚未接入生产 Adapter，也没有部署至主网。
+`contracts/` 已包含生产 QQQ/Pons Adapter、动态 Registry、资格签名、部署/激活脚本、单元测试和真实 Robinhood 主网分叉成交测试。合约仍未经过独立审计；主网地址以 `/code` 与链上 Registry 为准。
