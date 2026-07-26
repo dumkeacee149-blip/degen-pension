@@ -34,6 +34,7 @@ import {
   vercelRuntimeValues,
   vercelCandidateDeployCommand,
   vercelPromoteCommand,
+  VERCEL_TEAM_SLUG,
   verifyOperatorControl,
 } from "../scripts/launch-production.mjs";
 import * as publicDeployment from "../src/productionDeployment.js";
@@ -312,7 +313,7 @@ test("production release stages with skip-domain and promotes only after the can
     "vercel", "deploy", "--prod", "--skip-domain", "--yes",
   ]);
   assert.deepEqual([...vercelPromoteCommand("https://candidate.vercel.app").args], [
-    "vercel", "promote", "https://candidate.vercel.app", "--yes",
+    "vercel", "promote", "https://candidate.vercel.app", "--yes", "--scope", VERCEL_TEAM_SLUG,
   ]);
   assert.notDeepEqual([...vercelCandidateDeployCommand().args], [
     "vercel", "deploy", "--prod", "--yes",

@@ -35,6 +35,7 @@ export const DEPLOYMENT_MANIFEST_FILE = resolve(
 );
 const RPC_URL = "https://rpc.mainnet.chain.robinhood.com";
 const SITE_URL = "https://degen-pension.vercel.app";
+export const VERCEL_TEAM_SLUG = "dumkeacee149-blips-projects";
 const PONS_FACTORY = "0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB";
 const WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
 const CANONICAL_QQQ = "0xD5f3879160bc7c32ebb4dC785F8a4F505888de68";
@@ -874,7 +875,7 @@ export function vercelPromoteCommand(candidateUrl) {
   const url = requireCandidateDeploymentUrl(candidateUrl);
   return Object.freeze({
     command: "npx",
-    args: Object.freeze(["vercel", "promote", url, "--yes"]),
+    args: Object.freeze(["vercel", "promote", url, "--yes", "--scope", VERCEL_TEAM_SLUG]),
   });
 }
 
