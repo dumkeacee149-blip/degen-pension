@@ -834,7 +834,14 @@ export function vercelCandidateDeployCommand() {
 
 function requireCandidateDeploymentUrl(value) {
   const raw = String(value || "").replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, " ");
-  const matches = raw.match(/https:\/\/[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\.vercel\.app(?:\/[^\s]*)?/g) || [];
+  const urlPattern = "https:\\/\\/[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\\.vercel\\.app(?:\\/[^\\s\\\"]*)?";
+  const explicitMatches = [
+    ...raw.matchAll(new RegExp(`(?:^|\\n)Production:\\s*(${urlPattern})`, "g")),
+    ...raw.matchAll(new RegExp(`"deployment"\\s*:\\s*\\{[\\s\\S]*?"url"\\s*:\\s*"(${urlPattern})"`, "g")),
+  ].map((match) => match[1]);
+  const matches = explicitMatches.length > 0
+    ? explicitMatches
+    : raw.match(new RegExp(urlPattern, "g")) || [];
   const origins = new Set();
   for (const match of matches) {
     let candidate;

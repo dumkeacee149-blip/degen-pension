@@ -703,6 +703,19 @@ test("release commit binding rejects a dirty worktree", async () => {
     }),
   });
   assert.equal(noisyCandidate.candidateUrl, "https://candidate-noisy.vercel.app");
+  const currentCliCandidate = await deployProductionCandidateAtCommit(commit, {
+    codeCommitLoader: async () => commit,
+    runCaptureImpl: async () => ({
+      code: 0,
+      stdout: "",
+      stderr: [
+        "Production: https://immutable-candidate.vercel.app [33s]",
+        "Aliased: https://moving-project-alias.vercel.app [33s]",
+        '{"status":"ok","deployment":{"url":"https://immutable-candidate.vercel.app"}}',
+      ].join("\n"),
+    }),
+  });
+  assert.equal(currentCliCandidate.candidateUrl, "https://immutable-candidate.vercel.app");
   await assert.rejects(
     deployProductionCandidateAtCommit(commit, {
       codeCommitLoader: async () => commit,
