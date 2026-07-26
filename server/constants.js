@@ -4,10 +4,14 @@ export const ROBINHOOD_CHAIN_ID = 4663;
 export const ROBINHOOD_CHAIN_ID_HEX = "0x1237";
 export const ROBINHOOD_RPC_URL = "https://rpc.mainnet.chain.robinhood.com";
 export const ROBINHOOD_EXPLORER_URL = "https://robinhoodchain.blockscout.com";
+export const ROBINHOOD_ASSET_REGISTRY_URL = "https://api.robinhood.com/rhj/assets";
 
 export const CANONICAL_QQQ = "0xD5f3879160bc7c32ebb4dC785F8a4F505888de68";
+export const CANONICAL_QQQ_DECIMALS = 18;
 export const CANONICAL_WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
 export const CANONICAL_USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
+export const CANONICAL_USDG_DECIMALS = 6;
+export const CANONICAL_USDG_QQQ_POOL = "0xEbD78dcfc8a6b3A696f1E191aD1ff321f9579f79";
 export const CANONICAL_V3_FACTORY = "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA";
 export const CANONICAL_SWAP_ROUTER = "0xCaf681a66D020601342297493863E78C959E5cb2";
 export const CANONICAL_QUOTER = "0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7";
@@ -86,6 +90,12 @@ export const SPLIT_BUY_TOPIC = keccak256(stringToHex(SPLIT_BUY_EVENT_SIGNATURE))
 export const SPLIT_BUY_EVENT = parseAbiItem(
   "event SplitBuy(address indexed payer,address indexed recipient,uint256 grossAmountIn,uint256 explicitFeeAmount,uint256 netAmountIn,uint256 projectAmountIn,uint256 stockAmountIn,uint256 projectAmountOut,uint256 stockAmountOut)",
 );
+export const UNISWAP_V3_SWAP_EVENT = parseAbiItem(
+  "event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)",
+);
+export const ERC20_DECIMALS_ABI = parseAbi([
+  "function decimals() view returns (uint8)",
+]);
 
 export const QUOTE_TYPED_DATA_TYPES = {
   Eligibility: [

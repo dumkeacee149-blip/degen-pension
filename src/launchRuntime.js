@@ -4,6 +4,8 @@ const BUY_NATIVE_SELECTOR = "0x111bc375";
 const BUY_NATIVE_HEAD_WORDS = 6;
 const BUY_NATIVE_DYNAMIC_OFFSET = 32 * BUY_NATIVE_HEAD_WORDS;
 const ELIGIBILITY_SIGNATURE_BYTES = 65;
+const MAX_PUBLIC_RPC_RESPONSE_BYTES = 512 * 1024;
+export const SPLIT_BUY_TOPIC = "0x3f48157d8f14c00327e39782f0aeb0f0de21cacab1712f09548ce09aca7d921c";
 const RUNTIME_CHECK_GROUPS = Object.freeze({
   runtime: [
     "rpcChain",
@@ -25,6 +27,13 @@ const RUNTIME_CHECK_GROUPS = Object.freeze({
     "eligibilitySigner",
     "policyHash",
   ],
+  operations: [
+    "stockAssetRegistry",
+    "statsIndexer",
+    "distributedRateLimit",
+    "monitoring",
+  ],
+  audit: ["independentAudit"],
 });
 
 export class LaunchRuntimeError extends Error {
@@ -216,7 +225,13 @@ function gateReady(value) {
 function readRuntimeGates(payload) {
   const checks = payload?.checks;
   if (!checks || typeof checks !== "object" || Array.isArray(checks)) {
-    return { runtime: false, quote: false, eligibility: false };
+    return {
+      runtime: false,
+      quote: false,
+      eligibility: false,
+      operations: false,
+      audit: false,
+    };
   }
   const groupReady = (group) => RUNTIME_CHECK_GROUPS[group]
     .every((field) => checks[field] === true);
@@ -224,6 +239,8 @@ function readRuntimeGates(payload) {
     runtime: groupReady("runtime"),
     quote: groupReady("quote"),
     eligibility: groupReady("eligibility"),
+    operations: groupReady("operations"),
+    audit: groupReady("audit"),
   };
 }
 
@@ -245,6 +262,47 @@ function makeAbortContext(signal, timeoutMs) {
       signal?.removeEventListener("abort", abortFromParent);
     },
   };
+}
+
+async function readBoundedRpcResponse(response) {
+  const lengthHeader = response?.headers?.get?.("content-length");
+  if (lengthHeader != null && lengthHeader !== "") {
+    const declaredLength = Number(lengthHeader);
+    if (!Number.isSafeInteger(declaredLength) || declaredLength < 0 || declaredLength > MAX_PUBLIC_RPC_RESPONSE_BYTES) {
+      throw new LaunchRuntimeError("RPC_UNAVAILABLE", "Canonical public RPC response exceeded the safety limit.");
+    }
+  }
+
+  if (response?.body?.getReader) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let size = 0;
+    let body = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value?.byteLength || 0;
+        if (size > MAX_PUBLIC_RPC_RESPONSE_BYTES) {
+          await reader.cancel();
+          throw new LaunchRuntimeError("RPC_UNAVAILABLE", "Canonical public RPC response exceeded the safety limit.");
+        }
+        body += decoder.decode(value, { stream: true });
+      }
+      return body + decoder.decode();
+    } finally {
+      reader.releaseLock?.();
+    }
+  }
+
+  if (typeof response?.text !== "function") {
+    throw new LaunchRuntimeError("RPC_UNAVAILABLE", "Canonical public RPC returned an unreadable response.");
+  }
+  const body = await response.text();
+  if (new TextEncoder().encode(body).byteLength > MAX_PUBLIC_RPC_RESPONSE_BYTES) {
+    throw new LaunchRuntimeError("RPC_UNAVAILABLE", "Canonical public RPC response exceeded the safety limit.");
+  }
+  return body;
 }
 
 async function fetchJson(url, init, {
@@ -292,7 +350,13 @@ export function blockedRuntimeState(reason = "Launch environment is incomplete."
     status: "blocked",
     ready: false,
     reason,
-    checks: { runtime: false, quote: false, eligibility: false },
+    checks: {
+      runtime: false,
+      quote: false,
+      eligibility: false,
+      operations: false,
+      audit: false,
+    },
     checkedAt: null,
     expiresAt: null,
     limits: null,
@@ -336,6 +400,14 @@ export async function loadRuntimeReadiness({
     label: "Runtime",
   });
   const publicStatus = String(payload.status || "").toUpperCase();
+  const expectedAddressMatches = (actual, expected, label) => {
+    const normalized = normalizeAddress(actual, label);
+    return !expected || normalized === normalizeAddress(expected, `Pinned ${label}`);
+  };
+  const expectedHashMatches = (actual, expected) => {
+    const normalized = String(actual || "").toLowerCase();
+    return !expected || normalized === String(expected).toLowerCase();
+  };
 
   if (payload.ready !== true) {
     if (!["NOT_CONFIGURED", "NOT_READY", "RPC_UNAVAILABLE"].includes(publicStatus)) {
@@ -344,7 +416,21 @@ export async function loadRuntimeReadiness({
     const foundationReady = payload.checks?.rpcChain === true
       && payload.checks?.foundationCode === true
       && payload.checks?.factoryAuthority === true
-      && payload.checks?.factoryImplementation === true;
+      && payload.checks?.factoryImplementation === true
+      && expectedAddressMatches(
+        payload.registryAddress || payload.factoryAddress,
+        market.factoryAddress,
+        "Runtime Registry",
+      )
+      && expectedAddressMatches(
+        payload.implementationAddress,
+        market.gatewayImplementationAddress,
+        "Gateway implementation",
+      )
+      && expectedHashMatches(
+        payload.implementationCodeHash,
+        market.gatewayImplementationCodeHash,
+      );
     let foundation = null;
     if (foundationReady) {
       try {
@@ -362,8 +448,10 @@ export async function loadRuntimeReadiness({
       && payload.checks?.gatewayCode === true
       && payload.checks?.gatewayInitialized === true
       && payload.checks?.gatewayBindings === true;
-    const canonical = discoveredMarketReady
-      ? {
+    let discoveredCanonical = null;
+    if (discoveredMarketReady) {
+      try {
+        discoveredCanonical = {
           chainId: normalizeChainId(payload.chainId),
           factoryAddress: normalizeAddress(payload.factoryAddress, "Runtime Factory"),
           gatewayAddress: normalizeAddress(payload.gatewayAddress, "Runtime Gateway"),
@@ -372,14 +460,37 @@ export async function loadRuntimeReadiness({
           inputTokenAddress: normalizeAddress(payload.inputTokenAddress, "Runtime input token"),
           projectAdapterAddress: normalizeAddress(payload.projectAdapterAddress, "Runtime project adapter"),
           stockAdapterAddress: normalizeAddress(payload.stockAdapterAddress, "Runtime stock adapter"),
-        }
-      : null;
+          activatedBlock: parseSafeNumber(payload.activatedBlock, "Runtime activation block"),
+        };
+      } catch {
+        discoveredCanonical = null;
+      }
+    }
+    const blockedManifestMatches = market.releaseManifestRequired !== true || Boolean(
+      market.releaseManifestActive === true
+      && discoveredCanonical
+      && market.factoryAddress
+      && market.gatewayAddress
+      && market.officialTokenAddress
+      && market.stockTokenAddress
+      && market.stockAdapterAddress
+      && Number.isSafeInteger(market.activatedBlock)
+      && market.activatedBlock > 0
+      && discoveredCanonical.chainId === chain.chainIdDecimal
+      && discoveredCanonical.factoryAddress === normalizeAddress(market.factoryAddress)
+      && discoveredCanonical.gatewayAddress === normalizeAddress(market.gatewayAddress)
+      && discoveredCanonical.officialTokenAddress === normalizeAddress(market.officialTokenAddress)
+      && discoveredCanonical.stockTokenAddress === normalizeAddress(market.stockTokenAddress)
+      && discoveredCanonical.stockAdapterAddress === normalizeAddress(market.stockAdapterAddress)
+      && discoveredCanonical.activatedBlock === market.activatedBlock
+    );
+    const canonical = blockedManifestMatches ? discoveredCanonical : null;
     return {
       status: publicStatus === "NOT_CONFIGURED" ? "prelaunch" : "blocked",
       ready: false,
       reason: publicStatus === "NOT_CONFIGURED"
         ? "The official CA and Gateway have not been atomically activated in the production registry."
-        : "Runtime, quote, and eligibility checks have not all passed.",
+        : "One or more production checks have not passed.",
       checks,
       checkedAt: liveWindow.checkedAt,
       expiresAt: liveWindow.expiresAt,
@@ -391,10 +502,6 @@ export async function loadRuntimeReadiness({
   }
 
   const chainMatches = normalizeChainId(payload.chainId) === chain.chainIdDecimal;
-  const expectedAddressMatches = (actual, expected, label) => {
-    const normalized = normalizeAddress(actual, label);
-    return !expected || normalized === normalizeAddress(expected, `Development ${label}`);
-  };
   const factoryMatches =
     expectedAddressMatches(payload.factoryAddress, market.factoryAddress, "Runtime Factory");
   const gatewayMatches =
@@ -410,6 +517,15 @@ export async function loadRuntimeReadiness({
     expectedAddressMatches(payload.projectAdapterAddress, market.projectAdapterAddress, "Runtime project adapter");
   const stockAdapterMatches =
     expectedAddressMatches(payload.stockAdapterAddress, market.stockAdapterAddress, "Runtime stock adapter");
+  const implementationMatches = expectedAddressMatches(
+    payload.implementationAddress,
+    market.gatewayImplementationAddress,
+    "Gateway implementation",
+  );
+  const implementationCodeHashMatches = expectedHashMatches(
+    payload.implementationCodeHash,
+    market.gatewayImplementationCodeHash,
+  );
   const eligibilityCheckerAddress = normalizeAddress(
     payload.eligibilityCheckerAddress,
     "Runtime eligibility checker",
@@ -419,6 +535,13 @@ export async function loadRuntimeReadiness({
     "Runtime eligibility signer",
   );
   const policyHash = String(payload.policyHash || "").toLowerCase();
+  const eligibilityCheckerMatches = expectedAddressMatches(
+    eligibilityCheckerAddress,
+    market.eligibilityCheckerAddress,
+    "Eligibility checker",
+  );
+  const eligibilityPolicyMatches = !market.eligibilityPolicyHash
+    || policyHash === String(market.eligibilityPolicyHash).toLowerCase();
   if (
     eligibilityCheckerAddress === "0x0000000000000000000000000000000000000000"
     || eligibilitySignerAddress === "0x0000000000000000000000000000000000000000"
@@ -433,12 +556,30 @@ export async function loadRuntimeReadiness({
     && (!market.activatedBlock || activatedBlock === market.activatedBlock);
   const explicitFeeMatches = explicitFeeBps <= 500
     && (market.explicitFeeBps === null || explicitFeeBps === market.explicitFeeBps);
+  const releaseManifestMatches = market.releaseManifestRequired !== true || (
+    market.releaseManifestActive === true
+    && Boolean(market.factoryAddress)
+    && Boolean(market.gatewayAddress)
+    && Boolean(market.officialTokenAddress)
+    && Number.isSafeInteger(market.activatedBlock)
+    && market.activatedBlock > 0
+    && factoryMatches
+    && gatewayMatches
+    && officialTokenMatches
+    && activatedBlockMatches
+    && implementationMatches
+    && implementationCodeHashMatches
+    && eligibilityCheckerMatches
+    && eligibilityPolicyMatches
+  );
   const statusReady = publicStatus === "READY" || publicStatus === "RUNTIME_READY";
   const ready = payload.ready === true
     && statusReady
     && checks.runtime
     && checks.quote
     && checks.eligibility
+    && checks.operations
+    && checks.audit
     && chainMatches
     && factoryMatches
     && gatewayMatches
@@ -447,8 +588,13 @@ export async function loadRuntimeReadiness({
     && inputTokenMatches
     && projectAdapterMatches
     && stockAdapterMatches
+    && implementationMatches
+    && implementationCodeHashMatches
+    && eligibilityCheckerMatches
+    && eligibilityPolicyMatches
     && activatedBlockMatches
-    && explicitFeeMatches;
+    && explicitFeeMatches
+    && releaseManifestMatches;
 
   const canonical = {
     chainId: chain.chainIdDecimal,
@@ -466,7 +612,7 @@ export async function loadRuntimeReadiness({
   return {
     status: ready ? "ready" : "blocked",
     ready,
-    reason: ready ? "" : "Runtime, quote, and eligibility must all pass against the official market.",
+    reason: ready ? "" : "One or more production checks did not pass against the official market.",
     checks,
     checkedAt: liveWindow.checkedAt,
     expiresAt: liveWindow.expiresAt,
@@ -486,8 +632,13 @@ export async function loadRuntimeReadiness({
       inputTokenMatches,
       projectAdapterMatches,
       stockAdapterMatches,
+      implementationMatches,
+      implementationCodeHashMatches,
+      eligibilityCheckerMatches,
+      eligibilityPolicyMatches,
       activatedBlockMatches,
       explicitFeeMatches,
+      releaseManifestMatches,
     },
   };
 }
@@ -827,21 +978,181 @@ export async function requestAndValidateQuote({
 }
 
 export async function waitForTransactionReceipt({
-  ethereum,
+  rpcUrl,
+  rpcRequest,
+  fetchImpl = globalThis.fetch,
   hash,
   gatewayAddress,
+  wallet,
+  transaction,
+  confirmations = 1,
   signal,
   timeoutMs = 120_000,
   pollMs = 1_500,
+  rpcTimeoutMs = 8_000,
 } = {}) {
-  if (!ethereum?.request) {
-    throw new LaunchRuntimeError("WALLET_UNAVAILABLE", "Wallet provider is unavailable.");
-  }
   if (!/^0x[a-fA-F0-9]{64}$/.test(String(hash || ""))) {
     throw new LaunchRuntimeError("INVALID_HASH", "Wallet returned an invalid transaction hash.");
   }
+  if (!Number.isSafeInteger(confirmations) || confirmations < 1 || confirmations > 100) {
+    throw new LaunchRuntimeError("INVALID_CONFIRMATIONS", "Receipt confirmation depth is invalid.");
+  }
+  if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs < 1_000 || rpcTimeoutMs > 30_000) {
+    throw new LaunchRuntimeError("INVALID_RUNTIME", "Public RPC timeout is invalid.");
+  }
+
+  let rpcId = 0;
+  const requestPublicRpc = typeof rpcRequest === "function"
+    ? rpcRequest
+    : async ({ method, params = [], signal: requestSignal }) => {
+        let endpoint;
+        try {
+          endpoint = new URL(rpcUrl);
+        } catch {
+          throw new LaunchRuntimeError("RPC_UNAVAILABLE", "Canonical public RPC is not configured.");
+        }
+        if (endpoint.protocol !== "https:" || typeof fetchImpl !== "function") {
+          throw new LaunchRuntimeError("RPC_UNAVAILABLE", "Canonical public RPC is not configured.");
+        }
+        rpcId += 1;
+        const abortContext = makeAbortContext(requestSignal, rpcTimeoutMs);
+        try {
+          const response = await fetchImpl(endpoint.href, {
+            method: "POST",
+            headers: { "content-type": "application/json", accept: "application/json" },
+            cache: "no-store",
+            body: JSON.stringify({ jsonrpc: "2.0", id: rpcId, method, params }),
+            signal: abortContext.signal,
+          });
+          if (!response?.ok) {
+            throw new LaunchRuntimeError("RPC_UNAVAILABLE", "Canonical public RPC rejected the confirmation request.");
+          }
+          const responseBody = await readBoundedRpcResponse(response);
+          let payload;
+          try {
+            payload = JSON.parse(responseBody);
+          } catch {
+            throw new LaunchRuntimeError("RPC_UNAVAILABLE", "Canonical public RPC returned invalid JSON.");
+          }
+          if (
+            !payload
+            || payload.jsonrpc !== "2.0"
+            || payload.id !== rpcId
+            || Object.hasOwn(payload, "error")
+            || !Object.hasOwn(payload, "result")
+          ) {
+            throw new LaunchRuntimeError("RPC_UNAVAILABLE", "Canonical public RPC returned an invalid confirmation response.");
+          }
+          return payload.result;
+        } catch (error) {
+          if (requestSignal?.aborted) throw error;
+          if (error instanceof LaunchRuntimeError) throw error;
+          throw new LaunchRuntimeError("RPC_UNAVAILABLE", "Canonical public RPC did not respond.");
+        } finally {
+          abortContext.dispose();
+        }
+      };
 
   const startedAt = Date.now();
+  const normalizedGateway = normalizeAddress(gatewayAddress, "Official Gateway");
+  const normalizedWallet = normalizeAddress(wallet, "Submitting wallet");
+  const expectedTarget = normalizeAddress(transaction?.to, "Quoted transaction target");
+  const expectedInput = String(transaction?.data || "").toLowerCase();
+  const expectedValue = parseUnsignedInteger(transaction?.value, "Quoted transaction value");
+  const expectedCall = decodeBuyNativeCalldata(expectedInput);
+  if (expectedTarget !== normalizedGateway) {
+    throw new LaunchRuntimeError("INVALID_RECEIPT", "Quoted transaction target does not match the official Gateway.");
+  }
+  if (!/^0x[0-9a-f]+$/.test(expectedInput) || expectedInput.length % 2 !== 0 || expectedValue <= 0n) {
+    throw new LaunchRuntimeError("INVALID_RECEIPT", "Quoted transaction binding is invalid.");
+  }
+
+  const validateIncludedTransaction = async (receipt) => {
+    const mined = await requestPublicRpc({
+      method: "eth_getTransactionByHash",
+      params: [hash],
+      signal,
+    });
+    if (!mined || typeof mined !== "object") {
+      throw new LaunchRuntimeError("INVALID_RECEIPT", "Confirmed transaction details are unavailable.");
+    }
+    const minedInput = String(mined.input ?? mined.data ?? "").toLowerCase();
+    let minedValue;
+    let minedFrom;
+    let minedTo;
+    try {
+      minedValue = parseUnsignedInteger(mined.value, "Confirmed transaction value");
+      minedFrom = normalizeAddress(mined.from, "Confirmed transaction sender");
+      minedTo = normalizeAddress(mined.to, "Confirmed transaction target");
+    } catch {
+      throw new LaunchRuntimeError("INVALID_RECEIPT", "Confirmed transaction bindings are invalid.");
+    }
+    if (
+      minedFrom !== normalizedWallet
+      || minedTo !== normalizedGateway
+      || minedInput !== expectedInput
+      || minedValue !== expectedValue
+    ) {
+      throw new LaunchRuntimeError(
+        "INVALID_RECEIPT",
+        "Confirmed transaction does not match the submitting wallet and exact executable quote.",
+      );
+    }
+
+    const splitLogs = Array.isArray(receipt.logs)
+      ? receipt.logs.filter((log) => (
+          String(log?.address || "").toLowerCase() === normalizedGateway
+          && String(log?.topics?.[0] || "").toLowerCase() === SPLIT_BUY_TOPIC
+        ))
+      : [];
+    if (splitLogs.length !== 1) {
+      throw new LaunchRuntimeError("INVALID_RECEIPT", "Confirmed transaction must emit exactly one official SplitBuy event.");
+    }
+    const splitLog = splitLogs[0];
+    if (
+      !Array.isArray(splitLog.topics)
+      || splitLog.topics.length !== 3
+      || !/^0x0{24}[0-9a-f]{40}$/i.test(String(splitLog.topics[1] || ""))
+      || !/^0x0{24}[0-9a-f]{40}$/i.test(String(splitLog.topics[2] || ""))
+    ) {
+      throw new LaunchRuntimeError("INVALID_RECEIPT", "Confirmed SplitBuy event topics are malformed.");
+    }
+    const payer = `0x${splitLog.topics[1].slice(-40)}`.toLowerCase();
+    const recipient = `0x${splitLog.topics[2].slice(-40)}`.toLowerCase();
+    const data = String(splitLog.data || "").toLowerCase();
+    if (!/^0x[0-9a-f]{448}$/.test(data)) {
+      throw new LaunchRuntimeError("INVALID_RECEIPT", "Confirmed SplitBuy event data is malformed.");
+    }
+    const words = Array.from({ length: 7 }, (_, index) => (
+      BigInt(`0x${data.slice(2 + index * 64, 2 + (index + 1) * 64)}`)
+    ));
+    const [grossAmountIn, explicitFeeAmount, netAmountIn, projectAmountIn, stockAmountIn, projectAmountOut, stockAmountOut] = words;
+    const expectedProjectAmountIn = netAmountIn * 9_900n / 10_000n;
+    const expectedStockAmountIn = netAmountIn - expectedProjectAmountIn;
+    if (
+      payer !== normalizedWallet
+      || recipient !== normalizedWallet
+      || grossAmountIn !== expectedValue
+      || explicitFeeAmount + netAmountIn !== grossAmountIn
+      || projectAmountIn + stockAmountIn !== netAmountIn
+      || projectAmountIn !== expectedProjectAmountIn
+      || stockAmountIn !== expectedStockAmountIn
+      || projectAmountIn <= 0n
+      || stockAmountIn <= 0n
+      || projectAmountOut <= 0n
+      || stockAmountOut <= 0n
+      || projectAmountOut < expectedCall.minProjectOut
+      || stockAmountOut < expectedCall.minStockOut
+    ) {
+      throw new LaunchRuntimeError(
+        "INVALID_RECEIPT",
+        "Confirmed SplitBuy event does not prove both quoted legs for the submitting wallet.",
+      );
+    }
+  };
+  let includedReceipt = null;
+  let includedBlock = null;
+  let includedBlockHash = null;
   while (Date.now() - startedAt < timeoutMs) {
     if (signal?.aborted) {
       throw new LaunchRuntimeError("ABORTED", "Receipt wait was interrupted.");
@@ -850,18 +1161,53 @@ export async function waitForTransactionReceipt({
       throw new LaunchRuntimeError("OFFLINE", "Transaction was submitted, but confirmation cannot be checked offline.");
     }
 
-    const receipt = await ethereum.request({
+    const receipt = await requestPublicRpc({
       method: "eth_getTransactionReceipt",
       params: [hash],
+      signal,
     });
-    if (receipt) {
-      if (String(receipt.to || "").toLowerCase() !== normalizeAddress(gatewayAddress, "Official Gateway")) {
+    if (!receipt) {
+      includedReceipt = null;
+      includedBlock = null;
+      includedBlockHash = null;
+    } else {
+      if (String(receipt.to || "").toLowerCase() !== normalizedGateway) {
         throw new LaunchRuntimeError("INVALID_RECEIPT", "Confirmed transaction did not target the official Gateway.");
       }
       if (String(receipt.status || "").toLowerCase() !== "0x1") {
         throw new LaunchRuntimeError("TRANSACTION_REVERTED", "The 99/1 transaction reverted.");
       }
-      return receipt;
+      const blockText = String(receipt.blockNumber || "");
+      const blockHash = String(receipt.blockHash || "").toLowerCase();
+      if (!/^0x[0-9a-fA-F]+$/.test(blockText) || !/^0x[0-9a-f]{64}$/.test(blockHash)) {
+        throw new LaunchRuntimeError("INVALID_RECEIPT", "Confirmed transaction receipt omitted canonical block data.");
+      }
+      const blockNumber = BigInt(blockText);
+      if (blockHash !== includedBlockHash || blockNumber !== includedBlock) {
+        await validateIncludedTransaction(receipt);
+        includedReceipt = receipt;
+        includedBlock = blockNumber;
+        includedBlockHash = blockHash;
+      }
+      if (confirmations === 1) return includedReceipt;
+    }
+
+    if (includedReceipt) {
+      const latestText = String(await requestPublicRpc({
+        method: "eth_blockNumber",
+        params: [],
+        signal,
+      }) || "");
+      if (!/^0x[0-9a-fA-F]+$/.test(latestText)) {
+        throw new LaunchRuntimeError("INVALID_RECEIPT", "Canonical public RPC returned an invalid latest block number.");
+      }
+      const latestBlock = BigInt(latestText);
+      const confirmationDepth = latestBlock >= includedBlock
+        ? latestBlock - includedBlock + 1n
+        : 0n;
+      if (confirmationDepth >= BigInt(confirmations)) {
+        return includedReceipt;
+      }
     }
 
     await new Promise((resolve, reject) => {

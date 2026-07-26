@@ -13,6 +13,11 @@ import {
 } from "./constants.js";
 import { decideEligibility } from "./eligibility.js";
 import { ApiError } from "./http.js";
+import {
+  PRODUCTION_RELEASE_MANIFEST,
+  isValidProductionReleaseManifest,
+  releaseManifestRuntimeMatches,
+} from "./release-manifest.js";
 import { getPublicClient, loadRuntime } from "./runtime.js";
 
 const BPS_DENOMINATOR = 10_000n;
@@ -166,6 +171,7 @@ export async function createQuote(config, {
   runtimeLoader = loadRuntime,
   clientFactory = getPublicClient,
   eligibilityDecider = decideEligibility,
+  releaseManifest = PRODUCTION_RELEASE_MANIFEST,
 }) {
   if (wallet.toLowerCase() !== recipient.toLowerCase()) {
     throw new ApiError(
@@ -174,11 +180,30 @@ export async function createQuote(config, {
       "Production eligibility currently requires payer and recipient to be the same wallet.",
     );
   }
+  const production = config.vercelEnvironment === "production";
+  if (production && !isValidProductionReleaseManifest(releaseManifest)) {
+    throw new ApiError(503, "RELEASE_MANIFEST_INVALID", "The checked-in production release manifest is invalid.");
+  }
+  if (production && releaseManifest.tradingActive !== true) {
+    throw new ApiError(
+      503,
+      "RELEASE_MANIFEST_INACTIVE",
+      "The checked-in production release manifest has not authorized trading.",
+    );
+  }
+  if (production && (!Number.isSafeInteger(config.confirmations) || config.confirmations < 1)) {
+    throw new ApiError(503, "CONFIRMATIONS_INVALID", "Production quotes require confirmed onchain state.");
+  }
   const runtime = await runtimeLoader(config, { fresh: true });
-  if (!runtime.ready) {
-    const failedChecks = Object.entries(runtime.checks)
+  const releaseManifestBound = !production
+    || releaseManifestRuntimeMatches(config, runtime, releaseManifest);
+  if (!runtime.ready || !releaseManifestBound) {
+    const failedChecks = Object.entries(runtime.checks || {})
       .filter(([, passed]) => !passed)
       .map(([name]) => name);
+    if (production && !releaseManifestBound && !failedChecks.includes("releaseManifest")) {
+      failedChecks.push("releaseManifest");
+    }
     throw new ApiError(503, "MARKET_NOT_READY", "The complete production market is not ready.", {
       status: runtime.status,
       failedChecks,

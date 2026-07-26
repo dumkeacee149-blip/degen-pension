@@ -1,4 +1,6 @@
 {
+  "schemaVersion": 1,
+  "manifestId": "robinhood-mainnet-production-v2",
   "network": "Robinhood Chain",
   "chainId": 4663,
   "protocolVersion": 2,
@@ -27,6 +29,7 @@
   "authorizationTransactionHash": "0x6b656d7bb00f262d71a98160dcc5f4f06f13a701ad19fd9d0f88405c5d77b2fa",
   "currentOfficialToken": null,
   "currentMarket": null,
+  "currentActivatedBlock": 0,
   "registrySourceVerified": true,
   "gatewayImplementationSourceVerified": true,
   "eligibilityCheckerSourceVerified": true,

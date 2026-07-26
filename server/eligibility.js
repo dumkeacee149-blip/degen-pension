@@ -6,6 +6,8 @@ import {
 import { getAddress } from "viem";
 import { ApiError } from "./http.js";
 import { hasStrongSecret } from "./config.js";
+import { isExternalEligibilityConfigured } from "./operations.js";
+import { readLimitedText } from "./response.js";
 
 const decisionCache = new Map();
 
@@ -19,14 +21,32 @@ function signTokenPayload(encodedPayload, secret) {
 
 function parseProviderExpiry(value, maximumSeconds) {
   const nowSeconds = Math.floor(Date.now() / 1_000);
-  let providerSeconds = 0;
+  let providerSeconds = Number.NaN;
   if (typeof value === "number") providerSeconds = Math.floor(value);
   if (typeof value === "string") {
     const parsed = Date.parse(value);
     if (Number.isFinite(parsed)) providerSeconds = Math.floor(parsed / 1_000);
   }
-  if (providerSeconds <= nowSeconds) return nowSeconds + maximumSeconds;
+  if (!Number.isSafeInteger(providerSeconds) || providerSeconds <= nowSeconds) return null;
   return Math.min(providerSeconds, nowSeconds + maximumSeconds);
+}
+
+function verifyProviderResponse(config, response, raw) {
+  const timestamp = response.headers.get("x-degen-provider-timestamp");
+  const suppliedSignature = String(response.headers.get("x-degen-provider-signature") || "")
+    .replace(/^sha256=/i, "");
+  const timestampSeconds = Number(timestamp);
+  const expectedSignature = createHmac("sha256", config.eligibilityProviderRequestSecret)
+    .update(`${timestamp}.${raw}`)
+    .digest("hex");
+  const supplied = /^[a-f0-9]{64}$/i.test(suppliedSignature)
+    ? Buffer.from(suppliedSignature, "hex")
+    : Buffer.alloc(0);
+  const expected = Buffer.from(expectedSignature, "hex");
+  return Number.isSafeInteger(timestampSeconds)
+    && Math.abs(Math.floor(Date.now() / 1_000) - timestampSeconds) <= 60
+    && supplied.length === expected.length
+    && timingSafeEqual(supplied, expected);
 }
 
 function publicDecision({ eligible, reason, countryCode, checkedAtSeconds, expiresAtSeconds, proof }) {
@@ -112,6 +132,13 @@ async function fetchProviderDecision(config, {
   notUSPerson,
   fetchImpl,
 }) {
+  if (config.vercelEnvironment === "production" && !isExternalEligibilityConfigured(config)) {
+    throw new ApiError(
+      503,
+      "EXTERNAL_ELIGIBILITY_NOT_CONFIGURED",
+      "Production requires a signed external eligibility provider.",
+    );
+  }
   if (config.eligibilityProviderMode === "geo_attestation" && !config.eligibilityProviderUrl) {
     return {
       eligible: true,
@@ -141,14 +168,19 @@ async function fetchProviderDecision(config, {
     headers.authorization = `Bearer ${config.eligibilityProviderApiKey}`;
   }
   if (hasStrongSecret(config.eligibilityProviderRequestSecret)) {
+    const requestTimestamp = String(Math.floor(Date.now() / 1_000));
+    headers["x-degen-provider-request-timestamp"] = requestTimestamp;
     headers["x-degen-pension-signature"] =
-      createHmac("sha256", config.eligibilityProviderRequestSecret).update(requestPayload).digest("hex");
+      createHmac("sha256", config.eligibilityProviderRequestSecret)
+        .update(`${requestTimestamp}.${requestPayload}`)
+        .digest("hex");
   }
 
   let response;
   try {
     response = await fetchImpl(config.eligibilityProviderUrl, {
       method: "POST",
+      redirect: "error",
       headers,
       body: requestPayload,
       signal: AbortSignal.timeout(config.eligibilityTimeoutMs),
@@ -159,20 +191,58 @@ async function fetchProviderDecision(config, {
   if (!response.ok) {
     throw new ApiError(503, "ELIGIBILITY_PROVIDER_UNAVAILABLE", "Eligibility provider rejected the check.");
   }
-  let payload;
+  let raw;
   try {
-    payload = await response.json();
+    raw = await readLimitedText(response, 32_768);
   } catch {
     throw new ApiError(503, "ELIGIBILITY_PROVIDER_INVALID", "Eligibility provider returned invalid JSON.");
   }
+  if (
+    !hasStrongSecret(config.eligibilityProviderRequestSecret)
+    || !verifyProviderResponse(config, response, raw)
+  ) {
+    throw new ApiError(503, "ELIGIBILITY_PROVIDER_UNTRUSTED", "Eligibility provider response signature is invalid.");
+  }
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    throw new ApiError(503, "ELIGIBILITY_PROVIDER_INVALID", "Eligibility provider returned invalid JSON.");
+  }
+  const decisionId = typeof payload?.decisionId === "string" ? payload.decisionId.trim() : "";
+  const provider = typeof payload?.provider === "string" ? payload.provider.trim() : "";
+  const reason = typeof payload?.reason === "string" ? payload.reason.trim() : "";
   if (typeof payload?.eligible !== "boolean") {
     throw new ApiError(503, "ELIGIBILITY_PROVIDER_INVALID", "Eligibility provider returned no decision.");
   }
+  if (
+    payload.schemaVersion !== 1
+    || String(payload.wallet || "").toLowerCase() !== wallet.toLowerCase()
+    || Number(payload.chainId) !== config.chainId
+    || String(payload.stockTokenAddress || "").toLowerCase() !== config.stockTokenAddress.toLowerCase()
+    || String(payload.countryCode || "").toUpperCase() !== countryCode
+  ) {
+    throw new ApiError(
+      503,
+      "ELIGIBILITY_PROVIDER_BINDING_MISMATCH",
+      "Eligibility provider decision does not match the requested wallet and market.",
+    );
+  }
+  if (
+    !decisionId
+    || decisionId.length > 160
+    || !provider
+    || provider.length > 80
+    || !reason
+    || reason.length > 120
+  ) {
+    throw new ApiError(503, "ELIGIBILITY_PROVIDER_INVALID", "Eligibility provider decision is not auditable.");
+  }
   return {
     eligible: payload.eligible,
-    reason: String(payload.reason || (payload.eligible ? "ELIGIBLE" : "PROVIDER_DENIED")).slice(0, 120),
-    decisionId: String(payload.decisionId || randomUUID()).slice(0, 160),
-    provider: String(payload.provider || "configured-provider").slice(0, 80),
+    reason,
+    decisionId,
+    provider,
     expiresAt: payload.expiresAt,
   };
 }
@@ -236,6 +306,9 @@ export async function decideEligibility(config, {
     fetchImpl,
   });
   const expiresAtSeconds = parseProviderExpiry(providerDecision.expiresAt, config.eligibilityTtlSeconds);
+  if (!expiresAtSeconds) {
+    throw new ApiError(503, "ELIGIBILITY_PROVIDER_INVALID", "Eligibility provider returned no valid future expiry.");
+  }
   const proof = providerDecision.eligible
     ? issueProviderProof(config, getAddress(wallet), countryCode, providerDecision, checkedAtSeconds, expiresAtSeconds)
     : undefined;

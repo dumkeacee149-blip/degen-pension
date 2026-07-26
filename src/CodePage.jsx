@@ -16,6 +16,7 @@ import {
   explorerAddress,
   PRODUCTION_DEPLOYMENT,
 } from "./productionDeployment.js";
+import { useRuntimeReadiness } from "./useRuntimeReadiness.js";
 import "./code-page.css";
 
 const CALCULATION_SOURCE = `function _calculateAmounts(uint256 grossAmountIn) private view returns (BuyAmounts memory amounts) {
@@ -57,27 +58,28 @@ const SETTLEMENT_SOURCE = `function _settleBuy(
     );
 }`;
 
-const MEMBER_INDEX_SOURCE = `const runtime = await loadRuntime(config);
-if (!runtime.ready) throw new ApiError(503, "GATEWAY_NOT_CONFIGURED");
-
-const recipients = new Set();
-let buyCount = 0;
-
-for (let fromBlock = BigInt(runtime.activatedBlock); fromBlock <= safeBlock; fromBlock += chunk) {
-  const toBlock = Math.min(fromBlock + LOG_BLOCK_CHUNK - 1, safeBlock);
-  const logs = await client.getLogs({
-    address: runtime.gatewayAddress,
-    event: SPLIT_BUY_EVENT,
-    fromBlock,
-    toBlock,
-    strict: true,
+const MEMBER_INDEX_SOURCE = `if (isStatsIndexerConfigured(config)) {
+  const bindings = {
+    gatewayAddress,
+    officialTokenAddress,
+    stockTokenAddress: config.stockTokenAddress,
+    activatedBlock,
+  };
+  const payload = await loadIndexedStatsSnapshot(config, {
+    ...bindings,
+    recipient,
+    fetchImpl,
   });
+  return indexedMemberSnapshot(config, payload, bindings, recipient);
+}
 
-  for (const log of logs) {
-    if (!log.args.recipient || log.args.stockAmountOut <= 0n) continue;
-    recipients.add(log.args.recipient.toLowerCase());
-    buyCount += 1;
-  }
+if (!canUseBoundedStatsFallback(config)) {
+  throw new ApiError(503, "STATS_INDEXER_REQUIRED");
+}
+
+// Explicit non-production fallback only; still confirmation-safe and bounded.
+if (scanBlocks > BigInt(config.memberMaxScanBlocks)) {
+  throw new ApiError(503, "MEMBER_INDEX_REQUIRED");
 }`;
 
 const BUY_CALL_SOURCE = `const executableQuote = await requestAndValidateQuote({
@@ -100,32 +102,29 @@ const transactionHash = await window.ethereum.request({
   }],
 });`;
 
-const ACTIVATION_SOURCE = `function createMarket(
-    AdoptMarketV2 calldata adoption,
-    bytes calldata signature
-) external returns (address market) {
-    if (block.timestamp > adoption.deadline) revert AuthorizationExpired(adoption.deadline);
-    if (usedNonces[adoption.nonce]) revert NonceAlreadyUsed(adoption.nonce);
+const ACTIVATION_SOURCE = `function activatePonsMarket(address officialToken)
+    external
+    returns (address market, address projectAdapter)
+{
+    if (msg.sender != launchOperator) revert UnauthorizedLaunchOperator(msg.sender);
+    if (!operatorAuthorized) revert LaunchOperatorNotAuthorized();
+    if (currentMarket != address(0)) revert MarketAlreadyActivated(currentMarket);
+    (market, projectAdapter) = _activate(officialToken, false);
+}
 
-    bytes32 digest = _hashAdoptMarket(adoption);
-    if (!projectAuthority.isValidSignatureNow(digest, signature)) {
-        revert InvalidProjectAuthoritySignature();
+function _activate(address officialToken, bool replacement)
+    private
+    returns (address market, address projectAdapter)
+{
+    projectAdapter = ponsAdapterFactory.adapterFor(officialToken);
+    if (projectAdapter == address(0)) {
+        projectAdapter = ponsAdapterFactory.createAdapter(officialToken);
     }
-    usedNonces[adoption.nonce] = true;
-
     market = address(implementation).clone();
-    SplitBuyGatewayV2(market).initialize(
-        adoption.officialToken,
-        adoption.stockToken,
-        adoption.projectAdapter,
-        adoption.stockAdapter,
-        adoption.explicitFeeBps,
-        adoption.feeRecipient,
-        adoption.guardian,
-        adoption.eligibilityChecker,
-        adoption.maxAmountIn
+    SplitBuyGatewayV2(payable(market)).initialize(
+        officialToken, CANONICAL_QQQ, projectAdapter, address(stockAdapter),
+        0, address(0), address(this), address(eligibilityChecker), maxAmountIn
     );
-    isMarket[market] = true;
 }`;
 
 const QQQ_DELIVERY_SOURCE = `function _executeLeg(
@@ -178,9 +177,9 @@ const CODE_BLOCKS = [
   },
   {
     number: "05",
-    title: "AUTHORIZED ADOPTION",
-    tag: "SIGNED + NONCED",
-    source: "contracts/src/MarketFactoryV2.sol",
+    title: "CA-ONLY V2 ACTIVATION",
+    tag: "PREAUTHORIZED OPERATOR",
+    source: "contracts/src/ProductionMarketActivator.sol",
     code: ACTIVATION_SOURCE,
   },
 ];
@@ -204,7 +203,21 @@ function CodeBrand() {
   );
 }
 
+function liveGateLabel(runtime, check, readyLabel = "READY") {
+  if (runtime.status === "checking") return "CHECKING";
+  if (runtime.ready && runtime.checks?.[check]) return readyLabel;
+  if (runtime.checks?.[check]) return "CHECK PASSED · MARKET BLOCKED";
+  return "BLOCKED";
+}
+
 export function CodePage() {
+  const runtime = useRuntimeReadiness();
+  const liveMarketStatus = runtime.status === "checking"
+    ? "CHECKING"
+    : runtime.ready
+      ? "READY"
+      : "BLOCKED";
+
   useEffect(() => {
     document.title = "PROJECT CODE - DEGEN PENSION";
   }, []);
@@ -215,7 +228,6 @@ export function CodePage() {
       <header className="code-page-header">
         <CodeBrand />
         <div className="code-page-header-actions">
-          <span className="code-page-risk"><WarningCircle size={16} weight="fill" /> UNAUDITED MVP</span>
           <a className="code-page-back" href="/flow">HOW IT WORKS</a>
           <a className="code-page-back" href="/"><ArrowLeft size={17} weight="bold" /> BACK TO HOME</a>
         </div>
@@ -223,10 +235,10 @@ export function CodePage() {
 
       <main className="code-page-main" id="code-page-main" tabIndex={-1}>
         <section className="code-page-intro">
-          <span className="code-page-kicker">PUBLIC LOGIC · IMPLEMENTED + TESTED PATHS</span>
+          <span className="code-page-kicker">PUBLIC LOGIC · REPOSITORY TESTS · LIVE STATUS SEPARATE</span>
           <h1>THE MEME IS LOUD.<br /><em>THE CODE IS PUBLIC.</em></h1>
           <div className="code-page-intro-copy">
-            <p>These source-matched excerpts are formatted for this page without changing the expressions or calls that calculate the split, execute both legs, count public members, and submit the official Gateway transaction.</p>
+            <p>These source-matched excerpts show implemented and repository-tested logic. They are not a production-readiness claim; the live gate below is the authority for whether a buy route is currently usable.</p>
             <nav aria-label="Runtime code sections">
               <a href="#qqq-delivery"><b>QQQ</b>DELIVERY READINESS</a>
               {CODE_BLOCKS.map((block) => (
@@ -239,41 +251,87 @@ export function CodePage() {
         <section className="code-page-deployment" id="deployment-proof" aria-labelledby="deployment-proof-heading">
           <div className="code-page-section-label">
             <ShieldCheck size={23} weight="fill" />
-            <span id="deployment-proof-heading">FOUNDATION CONTRACTS · ONCHAIN RECORD</span>
+            <span id="deployment-proof-heading">PRODUCTION V2 · AUTHORITATIVE ONCHAIN RECORD</span>
           </div>
           <div className="code-page-deployment-status">
-            <div><b>FOUNDATION</b><strong>VERIFIED</strong></div>
+            <div><b>PRODUCTION V2</b><strong>{PRODUCTION_DEPLOYMENT.tradingActive ? "MARKET RECORDED" : "PREAUTHORIZED"}</strong></div>
             <p>
-              MarketFactory and its locked SplitBuyGateway implementation are deployed and
-              source-verified. This is foundation proof only: there is no adopted official
-              token, active market or executable buy route.
+              The ProductionMarketActivator registry and its fixed V2 components are deployed
+              and source-verified. The operator is authorized.
+              {PRODUCTION_DEPLOYMENT.tradingActive
+                ? " The checked-in manifest pins the current official CA, Gateway and activation block."
+                : " The checked-in manifest records no official CA or current market."}
+              {" "}A buy route exists only when every live runtime gate below reports READY at the same time.
+            </p>
+          </div>
+          <div className="code-page-live-gates" role="status" aria-live="polite" aria-atomic="true">
+            <div className="code-page-live-gates-heading">
+              <span>LIVE PRODUCTION GATE</span>
+              <strong>{liveMarketStatus}</strong>
+            </div>
+            <dl>
+              <div><dt>ONCHAIN RUNTIME</dt><dd>{liveGateLabel(runtime, "runtime")}</dd></div>
+              <div><dt>QUOTE ROUTE / SERVICE</dt><dd>{liveGateLabel(runtime, "quote", "ROUTE READY")}</dd></div>
+              <div><dt>ELIGIBILITY SERVICE</dt><dd>{liveGateLabel(runtime, "eligibility")}</dd></div>
+              <div><dt>OPERATIONS</dt><dd>{liveGateLabel(runtime, "operations")}</dd></div>
+              <div><dt>INDEPENDENT AUDIT</dt><dd>{liveGateLabel(runtime, "audit")}</dd></div>
+            </dl>
+            <p>
+              {runtime.status === "checking"
+                ? "Reading the same-origin production runtime. No capability is marked ready while this check is incomplete."
+                : runtime.ready
+                  ? "All release gates passed against the same canonical market. The homepage still rechecks them immediately before any wallet request."
+                  : `Buying remains disabled. ${runtime.reason || "One or more production checks did not pass."}`}
             </p>
           </div>
           <dl className="code-page-deployment-grid">
             <div>
-              <dt>MARKETFACTORY</dt>
-              <dd>{PRODUCTION_DEPLOYMENT.marketFactoryAddress}</dd>
-              <a href={explorerAddress(PRODUCTION_DEPLOYMENT.marketFactoryAddress)} target="_blank" rel="noreferrer">SOURCE VERIFIED <ArrowSquareOut weight="bold" /></a>
+              <dt>PRODUCTION V2 REGISTRY</dt>
+              <dd>{PRODUCTION_DEPLOYMENT.registryAddress}</dd>
+              <a href={explorerAddress(PRODUCTION_DEPLOYMENT.registryAddress)} target="_blank" rel="noreferrer">SOURCE VERIFIED <ArrowSquareOut weight="bold" /></a>
             </div>
             <div>
-              <dt>LOCKED GATEWAY IMPLEMENTATION</dt>
+              <dt>LOCKED V2 GATEWAY IMPLEMENTATION</dt>
               <dd>{PRODUCTION_DEPLOYMENT.gatewayImplementationAddress}</dd>
               <a href={explorerAddress(PRODUCTION_DEPLOYMENT.gatewayImplementationAddress)} target="_blank" rel="noreferrer">SOURCE VERIFIED <ArrowSquareOut weight="bold" /></a>
             </div>
             <div>
-              <dt>IMMUTABLE PROJECT AUTHORITY</dt>
-              <dd>{PRODUCTION_DEPLOYMENT.projectAuthority}</dd>
-              <a href={explorerAddress(PRODUCTION_DEPLOYMENT.projectAuthority)} target="_blank" rel="noreferrer">READ ONCHAIN <ArrowSquareOut weight="bold" /></a>
+              <dt>FIXED LAUNCH OPERATOR</dt>
+              <dd>{PRODUCTION_DEPLOYMENT.launchOperator}</dd>
+              <a href={explorerAddress(PRODUCTION_DEPLOYMENT.launchOperator)} target="_blank" rel="noreferrer">PREAUTHORIZED ONCHAIN <ArrowSquareOut weight="bold" /></a>
             </div>
             <div>
               <dt>ADOPTED MARKET</dt>
-              <dd>NOT ACTIVE</dd>
-              <span>NO OFFICIAL CA · NO MARKET CLONE</span>
+              <dd>{runtime.ready
+                ? runtime.canonical?.gatewayAddress
+                : PRODUCTION_DEPLOYMENT.tradingActive
+                  ? PRODUCTION_DEPLOYMENT.activeMarketAddress
+                  : "NOT ACTIVE"}</dd>
+              <span>
+                {runtime.ready
+                  ? "CANONICAL GATEWAY · ALL LIVE GATES PASSED"
+                  : runtime.canonical?.gatewayAddress
+                    ? "CANONICAL MARKET DISCOVERED · BUY GATES BLOCKED"
+                    : PRODUCTION_DEPLOYMENT.tradingActive
+                      ? `MANIFEST MARKET RECORDED · LIVE BUY GATES BLOCKED · ACTIVATION ${PRODUCTION_DEPLOYMENT.activatedBlock}`
+                      : "MANIFEST HAS NO OFFICIAL CA OR CURRENT MARKET"}
+              </span>
             </div>
           </dl>
+          <p className="code-page-legacy-note">
+            LEGACY V1 REFERENCE ONLY · The earlier MarketFactory at{" "}
+            <a href={explorerAddress(PRODUCTION_DEPLOYMENT.legacyV1Foundation.marketFactoryAddress)} target="_blank" rel="noreferrer">
+              {PRODUCTION_DEPLOYMENT.legacyV1Foundation.marketFactoryAddress}
+            </a>{" "}
+            is not the authoritative Production V2 launch path.
+          </p>
           <div className="code-page-hash">
             <span>RUNTIME GATE</span>
-            <code>PRE-LAUNCH · MARKET NOT ACTIVE · BUYING DISABLED</code>
+            <code>
+              {runtime.ready
+                ? "LIVE CHECK PASSED · HOMEPAGE RECHECK REQUIRED BEFORE WALLET"
+                : `${liveMarketStatus} · ${PRODUCTION_DEPLOYMENT.tradingActive ? "MANIFEST MARKET RECORDED" : "MARKET NOT ACTIVE"} · BUYING DISABLED`}
+            </code>
           </div>
         </section>
 
@@ -293,7 +351,11 @@ export function CodePage() {
             <div>
               <span>DELIVERY MODEL</span>
               <strong>BOUGHT, NOT AIRDROPPED.</strong>
-              <p>The Gateway implementation requires the 1% stock leg to reach the buyer in the same transaction. A future adopted market must bind a real deployed adapter and executable QQQ liquidity route. Neither is production-deployed today.</p>
+              <p>
+                The Gateway implementation requires the 1% stock leg to reach the buyer in the
+                same transaction. The live production gate determines whether a canonical market
+                currently binds a real adapter and executable QQQ liquidity route.
+              </p>
             </div>
           </div>
           <div className="code-page-qqq-detail">
@@ -302,12 +364,33 @@ export function CodePage() {
               <div className="is-registered"><b>REGISTRY LIVE</b><p>Canonical Robinhood QQQ CA is identified by the chain-4663 asset registry.</p></div>
               <div className="is-implemented"><b>IMPLEMENTED · TESTED</b><p>Gateway measures the recipient&apos;s output-token balance delta after each adapter call.</p></div>
               <div className="is-implemented"><b>IMPLEMENTED · TESTED</b><p>Missing output, slippage failure or adapter mismatch reverts both 99% and 1% legs.</p></div>
-              <div className="is-not-deployed"><b>NOT DEPLOYED</b><p>No production QQQ adapter or executable WETH → USDG → QQQ liquidity route is bound.</p></div>
-              <div className="is-pending"><b>PENDING</b><p>The official project token and its authority-approved project adapter have not been adopted.</p></div>
-              <div className="is-not-deployed"><b>NOT DEPLOYED</b><p>Executable quote, Gateway simulation and eligibility services are not production-deployed.</p></div>
+              <div className={runtime.ready ? "is-runtime-ready" : "is-not-deployed"}>
+                <b>{runtime.ready ? "LIVE BINDING VERIFIED" : "NOT READY"}</b>
+                <p>
+                  {runtime.ready
+                    ? "The canonical runtime verified the deployed QQQ adapter and executable settlement route."
+                    : "No production QQQ adapter and executable WETH → USDG → QQQ route passed the live gate."}
+                </p>
+              </div>
+              <div className={runtime.ready ? "is-runtime-ready" : "is-pending"}>
+                <b>{runtime.ready ? "CA ADOPTED" : "PENDING"}</b>
+                <p>
+                  {runtime.ready
+                    ? "The authority-approved official token and project adapter are bound to the canonical Gateway."
+                    : "No authority-approved official project token and adapter passed the live gate."}
+                </p>
+              </div>
+              <div className={runtime.ready ? "is-runtime-ready" : "is-not-deployed"}>
+                <b>{runtime.ready ? "LIVE CHECKS PASSED" : "BLOCKED"}</b>
+                <p>
+                  {runtime.ready
+                    ? "The quote route/service health, simulation control and eligibility service passed. An amount-bound executable quote is generated only after buyer input and eligibility."
+                    : "Quote route/service health, Gateway simulation controls and eligibility are not all production-ready."}
+                </p>
+              </div>
             </div>
           </div>
-          <p className="code-page-qqq-note">Production readiness requires a signed market adoption that binds the official CA, a real project adapter, a real QQQ adapter, executable liquidity, quote simulation and eligibility controls. Until all of them exist and pass live checks, the site must not return a sendable buy transaction.</p>
+          <p className="code-page-qqq-note">Production readiness requires the pinned V2 registry, its preauthorized fixed launch operator, and CA-only <code>activatePonsMarket(officialToken)</code> path to produce a canonical market whose liquidity, quote simulation and eligibility controls all pass the same live check. Otherwise the site must not return a sendable buy transaction.</p>
         </section>
 
         <section className="code-page-formula" aria-labelledby="code-formula-heading">
@@ -337,7 +420,7 @@ export function CodePage() {
         <section className="code-page-runtime" aria-labelledby="code-runtime-heading">
           <div className="code-page-section-label">
             <Code size={23} weight="fill" />
-            <span id="code-runtime-heading">FIVE IMPLEMENTED CODE PATHS</span>
+            <span id="code-runtime-heading">FIVE IMPLEMENTATION PATHS · NOT LIVE-READINESS CLAIMS</span>
           </div>
           <div className="code-page-grid">
             {CODE_BLOCKS.map((block) => (
@@ -357,7 +440,7 @@ export function CodePage() {
           <div><CheckCircle size={25} weight="fill" /><p><b>DIRECT · TESTED</b>The Gateway implementation measures both output-token balance changes at the recipient.</p></div>
           <div><CheckCircle size={25} weight="fill" /><p><b>ATOMIC · TESTED</b>The Gateway implementation unwinds the transaction if the fee transfer or either adapter call reverts.</p></div>
           <div><Wallet size={25} weight="fill" /><p><b>DEFERRED WALLET</b>The homepage asks for a wallet only after the buyer confirms an amount.</p></div>
-          <div className="code-page-warning"><WarningCircle size={25} weight="fill" /><p><b>UNAUDITED</b>Tests and a real-chain fork are not a substitute for an independent security review. Regional IP gating and user attestation are technical controls, not legal advice or identity-level KYC.</p></div>
+          <div className="code-page-warning"><WarningCircle size={25} weight="fill" /><p><b>UNAUDITED · EXTERNAL PROVIDER REQUIRED</b>Tests and a real-chain fork are not a substitute for an independent security review. Production stock-token eligibility requires a configured external sanctions/KYC provider; the current public service is not configured and self-attestation alone is insufficient.</p></div>
         </section>
       </main>
 

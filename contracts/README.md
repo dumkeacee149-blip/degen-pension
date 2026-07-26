@@ -60,15 +60,21 @@ forge script script/AuthorizeLaunchOperator.s.sol:AuthorizeLaunchOperator \
   --broadcast
 ```
 
-## Launch day: one variable
+## Launch day: one market variable, one pinned control stack
 
-After Pons has created the official token and canonical 1% WETH pool, set only
-`OFFICIAL_TOKEN_ADDRESS` and run:
+`contracts/deployments/robinhood-mainnet.json` is the sole production deployment
+manifest. Before signing anything, verify that `REGISTRY_ADDRESS` and the selected
+Foundry account resolve to its exact `registry` and immutable `launchOperator`.
+The project authority is a different role and cannot activate this Registry.
+
+After Pons has created the official token and canonical 1% WETH pool, set the one
+new market value, `OFFICIAL_TOKEN_ADDRESS`, and run the activation through the
+team-approved controlled signer:
 
 ```sh
 forge script script/ActivatePonsMarket.s.sol:ActivatePonsMarket \
   --rpc-url "$RH_RPC_URL" \
-  --account degen-pension-deployer \
+  --account <CONTROLLED_MANIFEST_LAUNCH_OPERATOR> \
   --broadcast
 ```
 
@@ -77,6 +83,13 @@ different fee tier, a mismatched token pool, a second activation, an unauthorize
 operator, or a missing pre-authorization. For a valid CA it creates the immutable
 project adapter, initializes a Gateway clone, registers it and unpauses it in the
 same transaction.
+
+After confirmation, update the same deployment manifest from the activation
+Receipt and commit it for review. Activation alone is not a Go decision. The
+production release gate must additionally pass Runtime `READY`, eligibility,
+quote, an independent `eth_call`, and a confirmed two-leg mainnet canary. See
+`docs/LAUNCH_RUNBOOK.md`. The desktop release script never sends the activation
+or canary transaction and never deploys a replacement Registry.
 
 ## Verification
 

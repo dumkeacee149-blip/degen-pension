@@ -6,14 +6,20 @@ const initialState = MARKET.bootstrapConfigured
   ? {
       status: "checking",
       ready: false,
-      reason: "Checking runtime, quote, and eligibility services.",
-      checks: { runtime: false, quote: false, eligibility: false },
+      reason: "Checking all production services and controls.",
+      checks: {
+        runtime: false,
+        quote: false,
+        eligibility: false,
+        operations: false,
+        audit: false,
+      },
       checkedAt: null,
       expiresAt: null,
       limits: null,
     }
   : blockedRuntimeState(
-      "Official CA, Gateway, activation block, runtime, quote, and eligibility endpoints are required.",
+      "Official CA, Gateway, activation block, and all production services and controls are required.",
     );
 
 export function isAbortedRequest(error, signal) {
@@ -29,7 +35,7 @@ export function useRuntimeReadiness() {
   const refresh = useCallback(async ({ quiet = false } = {}) => {
     if (!MARKET.bootstrapConfigured) {
       const blocked = blockedRuntimeState(
-        "Official CA, Gateway, activation block, runtime, quote, and eligibility endpoints are required.",
+        "Official CA, Gateway, activation block, and all production services and controls are required.",
       );
       setState(blocked);
       return blocked;
@@ -46,7 +52,7 @@ export function useRuntimeReadiness() {
         ...current,
         status: "checking",
         ready: false,
-        reason: "Checking runtime, quote, and eligibility services.",
+        reason: "Checking all production services and controls.",
       }));
     }
 
@@ -67,7 +73,13 @@ export function useRuntimeReadiness() {
         status: "error",
         ready: false,
         reason: error?.message || "Runtime readiness check failed.",
-        checks: { runtime: false, quote: false, eligibility: false },
+        checks: {
+          runtime: false,
+          quote: false,
+          eligibility: false,
+          operations: false,
+          audit: false,
+        },
         checkedAt: null,
         expiresAt: null,
         limits: null,

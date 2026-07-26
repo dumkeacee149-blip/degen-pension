@@ -19,13 +19,21 @@ import {
   REGISTRY_ABI,
   ROBINHOOD_CHAIN_ID,
 } from "./constants.js";
-import { hasStrongSecret } from "./config.js";
+import { checkOperationalReadiness } from "./operations.js";
+import {
+  PRODUCTION_RELEASE_MANIFEST,
+  isValidProductionReleaseManifest,
+  publicReleaseManifestState,
+  releaseManifestConfigMatches,
+  releaseManifestSnapshotMatches,
+} from "./release-manifest.js";
 
 const runtimeCache = new Map();
 const clientCache = new Map();
 
 // These names are part of the public fail-closed contract with the browser.
 const CHECK_NAMES = [
+  "releaseManifest",
   "rpcChain",
   "foundationCode",
   "factoryAuthority",
@@ -43,6 +51,11 @@ const CHECK_NAMES = [
   "eligibilitySigner",
   "policyHash",
   "activatedBlock",
+  "statsIndexer",
+  "distributedRateLimit",
+  "monitoring",
+  "independentAudit",
+  "stockAssetRegistry",
 ];
 
 function baseChecks() {
@@ -97,7 +110,7 @@ export function getPublicClient(config) {
   return clientCache.get(key);
 }
 
-function cacheKey(config) {
+function cacheKey(config, releaseManifest) {
   return [
     config.rpcUrl,
     config.registryAddress,
@@ -108,6 +121,17 @@ function cacheKey(config) {
     config.quoterAddress,
     config.expectedEligibilityChecker,
     config.expectedEligibilityPolicyHash,
+    config.vercelEnvironment,
+    config.stockAssetRegistryCheckEnabled,
+    config.statsIndexerUrl,
+    config.rateLimitProviderUrl,
+    config.monitoringWebhookUrl,
+    config.independentAuditSha256,
+    releaseManifest?.manifestId,
+    releaseManifest?.tradingActive,
+    releaseManifest?.currentOfficialToken,
+    releaseManifest?.currentMarket,
+    releaseManifest?.currentActivatedBlock,
   ].join(":");
 }
 
@@ -144,14 +168,20 @@ function publicLimits(config, onchainMaximum = null) {
   };
 }
 
-function publicBase(config, checkedAt, expiresAt, checks) {
+function publicBase(config, checkedAt, expiresAt, checks, operations, {
+  registryAddress = config.registryAddress,
+  releaseManifest = PRODUCTION_RELEASE_MANIFEST,
+} = {}) {
+  const production = config.vercelEnvironment === "production";
   return {
     schemaVersion: 1,
     ready: false,
     status: "NOT_CONFIGURED",
     chainId: config.chainId,
-    registryAddress: config.registryAddress,
-    factoryAddress: config.registryAddress,
+    protocolVersion: null,
+    registryAddress,
+    factoryAddress: registryAddress,
+    projectAuthorityAddress: null,
     gatewayAddress: null,
     officialTokenAddress: null,
     stockTokenAddress: config.stockTokenAddress,
@@ -162,9 +192,15 @@ function publicBase(config, checkedAt, expiresAt, checks) {
     eligibilitySignerAddress: null,
     policyHash: null,
     activatedBlock: 0,
+    marketRegistered: false,
+    gatewayInitializedOnchain: false,
+    gatewayPaused: null,
     explicitFeeBps: null,
+    onchainMaximumBuyWei: null,
     limits: publicLimits(config),
     checks,
+    operations,
+    releaseManifest: publicReleaseManifestState({ production, manifest: releaseManifest }),
     checkedAt,
     expiresAt,
   };
@@ -178,14 +214,70 @@ function exactRoute(route, expectedTokens, expectedFees) {
     && route.fees.every((fee, index) => fee === expectedFees[index]);
 }
 
-function providerConfigured(config) {
-  const decisionProvider = config.eligibilityProviderMode === "geo_attestation"
-    || (config.eligibilityProviderMode === "external" && Boolean(config.eligibilityProviderUrl));
-  return decisionProvider && hasStrongSecret(config.eligibilitySigningSecret);
+function blockedOperationalReadiness(config, checkedAt) {
+  return {
+    checks: {
+      eligibilityProvider: false,
+      statsIndexer: false,
+      distributedRateLimit: false,
+      monitoring: false,
+      independentAudit: false,
+      stockAssetRegistry: false,
+    },
+    publicValue: {
+      environment: config.vercelEnvironment,
+      eligibilityProviderMode: config.eligibilityProviderMode,
+      eligibilityExternalRequired: config.vercelEnvironment === "production",
+      statsIndexer: {
+        configured: false,
+        healthy: false,
+        boundedFallbackEnabled: config.allowBoundedStatsFallback === true,
+      },
+      distributedRateLimitHealthy: false,
+      monitoringHealthy: false,
+      independentAuditVerified: false,
+      stockAssetRegistry: {
+        verified: false,
+        tokenSymbol: null,
+        status: null,
+        marketWhole: null,
+        marketFractional: null,
+        checkedAt,
+      },
+    },
+  };
 }
 
-export async function loadRuntime(config, { fresh = false } = {}) {
-  const key = cacheKey(config);
+export async function loadRuntime(config, {
+  fresh = false,
+  operationsChecker = checkOperationalReadiness,
+  clientFactory = getPublicClient,
+  releaseManifest = PRODUCTION_RELEASE_MANIFEST,
+} = {}) {
+  const production = config.vercelEnvironment === "production";
+  const validReleaseManifest = isValidProductionReleaseManifest(releaseManifest);
+  const registryAddress = production && validReleaseManifest
+    ? releaseManifest.registry
+    : config.registryAddress;
+  const expectedAuthority = production && validReleaseManifest
+    ? releaseManifest.projectAuthority
+    : config.expectedAuthority;
+  const expectedImplementation = production && validReleaseManifest
+    ? releaseManifest.gatewayImplementation
+    : config.expectedImplementation;
+  const expectedImplementationCodeHash = production && validReleaseManifest
+    ? releaseManifest.gatewayImplementationRuntimeCodeHash
+    : config.expectedImplementationCodeHash;
+  const expectedEligibilityChecker = production && validReleaseManifest
+    ? releaseManifest.eligibilityChecker
+    : config.expectedEligibilityChecker;
+  const expectedEligibilityPolicyHash = production && validReleaseManifest
+    ? releaseManifest.eligibilityPolicyHash
+    : config.expectedEligibilityPolicyHash;
+  const expectedProtocolVersion = production && validReleaseManifest
+    ? releaseManifest.protocolVersion
+    : 2;
+  const key = cacheKey(config, releaseManifest);
   const cached = runtimeCache.get(key);
   if (!fresh && cached && cached.expiresAtMs > Date.now()) return cached.value;
 
@@ -194,27 +286,43 @@ export async function loadRuntime(config, { fresh = false } = {}) {
   const expiresAtMs = now + config.runtimeCacheSeconds * 1_000;
   const expiresAt = new Date(expiresAtMs).toISOString();
   const checks = baseChecks();
-  const base = publicBase(config, checkedAt, expiresAt, checks);
+  checks.releaseManifest = !production;
+  let operationalReadiness;
+  if (production && validReleaseManifest && releaseManifest.tradingActive !== true) {
+    operationalReadiness = blockedOperationalReadiness(config, checkedAt);
+  } else {
+    try {
+      operationalReadiness = await operationsChecker(config);
+    } catch {
+      operationalReadiness = blockedOperationalReadiness(config, checkedAt);
+    }
+  }
+  Object.assign(checks, operationalReadiness.checks);
+  const base = publicBase(config, checkedAt, expiresAt, checks, operationalReadiness.publicValue, {
+    registryAddress,
+    releaseManifest,
+  });
 
   if (
-    !config.registryAddress
-    || !config.expectedAuthority
-    || !config.expectedImplementation
-    || !/^0x[a-fA-F0-9]{64}$/.test(config.expectedImplementationCodeHash || "")
+    !registryAddress
+    || !expectedAuthority
+    || !expectedImplementation
+    || !/^0x[a-fA-F0-9]{64}$/.test(expectedImplementationCodeHash || "")
     || !config.stockTokenAddress
     || !config.quoterAddress
+    || (production && !validReleaseManifest)
   ) {
     const value = { ...base, status: "NOT_CONFIGURED" };
     runtimeCache.set(key, { expiresAtMs, value });
     return value;
   }
 
-  const client = getPublicClient(config);
+  const client = clientFactory(config);
   try {
     const [chainId, latestBlock, registryCode] = await Promise.all([
       client.getChainId(),
       client.getBlockNumber(),
-      bytecode(client, config.registryAddress),
+      bytecode(client, registryAddress),
     ]);
     checks.rpcChain = chainId === config.chainId;
 
@@ -232,24 +340,24 @@ export async function loadRuntime(config, { fresh = false } = {}) {
       registryMaximum,
       registryReady,
     ] = await Promise.all([
-      safeRead(client, { address: config.registryAddress, abi: REGISTRY_ABI, functionName: "protocolVersion" }),
-      safeRead(client, { address: config.registryAddress, abi: REGISTRY_ABI, functionName: "registry" }),
-      safeRead(client, { address: config.registryAddress, abi: REGISTRY_ABI, functionName: "projectAuthority" }),
-      safeRead(client, { address: config.registryAddress, abi: REGISTRY_ABI, functionName: "implementation" }),
-      safeRead(client, { address: config.registryAddress, abi: REGISTRY_ABI, functionName: "currentMarket" }),
-      safeRead(client, { address: config.registryAddress, abi: REGISTRY_ABI, functionName: "currentOfficialToken" }),
-      safeRead(client, { address: config.registryAddress, abi: REGISTRY_ABI, functionName: "currentProjectAdapter" }),
-      safeRead(client, { address: config.registryAddress, abi: REGISTRY_ABI, functionName: "currentStockAdapter" }),
-      safeRead(client, { address: config.registryAddress, abi: REGISTRY_ABI, functionName: "eligibilityChecker" }),
-      safeRead(client, { address: config.registryAddress, abi: REGISTRY_ABI, functionName: "currentActivatedBlock" }),
-      safeRead(client, { address: config.registryAddress, abi: REGISTRY_ABI, functionName: "maxAmountIn" }),
-      safeRead(client, { address: config.registryAddress, abi: REGISTRY_ABI, functionName: "marketReady" }),
+      safeRead(client, { address: registryAddress, abi: REGISTRY_ABI, functionName: "protocolVersion" }),
+      safeRead(client, { address: registryAddress, abi: REGISTRY_ABI, functionName: "registry" }),
+      safeRead(client, { address: registryAddress, abi: REGISTRY_ABI, functionName: "projectAuthority" }),
+      safeRead(client, { address: registryAddress, abi: REGISTRY_ABI, functionName: "implementation" }),
+      safeRead(client, { address: registryAddress, abi: REGISTRY_ABI, functionName: "currentMarket" }),
+      safeRead(client, { address: registryAddress, abi: REGISTRY_ABI, functionName: "currentOfficialToken" }),
+      safeRead(client, { address: registryAddress, abi: REGISTRY_ABI, functionName: "currentProjectAdapter" }),
+      safeRead(client, { address: registryAddress, abi: REGISTRY_ABI, functionName: "currentStockAdapter" }),
+      safeRead(client, { address: registryAddress, abi: REGISTRY_ABI, functionName: "eligibilityChecker" }),
+      safeRead(client, { address: registryAddress, abi: REGISTRY_ABI, functionName: "currentActivatedBlock" }),
+      safeRead(client, { address: registryAddress, abi: REGISTRY_ABI, functionName: "maxAmountIn" }),
+      safeRead(client, { address: registryAddress, abi: REGISTRY_ABI, functionName: "marketReady" }),
     ]);
 
     checks.foundationCode = Boolean(registryCode)
-      && Number(protocolVersion) === 2
-      && same(registrySelf, config.registryAddress);
-    checks.factoryAuthority = same(projectAuthority, config.expectedAuthority);
+      && Number(protocolVersion) === expectedProtocolVersion
+      && same(registrySelf, registryAddress);
+    checks.factoryAuthority = same(projectAuthority, expectedAuthority);
 
     const [implementationCode, implementationInitialized, implementationPaused] = await Promise.all([
       bytecode(client, implementation),
@@ -259,9 +367,9 @@ export async function loadRuntime(config, { fresh = false } = {}) {
     checks.factoryImplementation = Boolean(implementationCode)
       && implementationInitialized === true
       && implementationPaused === true
-      && (!config.expectedImplementation || same(implementation, config.expectedImplementation))
-      && (!config.expectedImplementationCodeHash
-        || keccak256(implementationCode) === config.expectedImplementationCodeHash);
+      && (!expectedImplementation || same(implementation, expectedImplementation))
+      && (!expectedImplementationCodeHash
+        || keccak256(implementationCode) === expectedImplementationCodeHash);
 
     const activatedBlock = Number(activatedBlockRaw || 0n);
     const marketConfigured = nonZero(gatewayAddress)
@@ -273,8 +381,16 @@ export async function loadRuntime(config, { fresh = false } = {}) {
       const value = {
         ...base,
         status: "NOT_CONFIGURED",
+        protocolVersion: protocolVersion === null ? null : Number(protocolVersion),
+        projectAuthorityAddress: projectAuthority || null,
         implementationAddress: implementation || null,
         implementationCodeHash: implementationCode ? keccak256(implementationCode) : null,
+        onchainMaximumBuyWei: registryMaximum === null ? null : String(registryMaximum),
+        releaseManifest: publicReleaseManifestState({
+          production,
+          manifest: releaseManifest,
+          bound: false,
+        }),
         checks,
       };
       runtimeCache.set(key, { expiresAtMs, value });
@@ -283,7 +399,7 @@ export async function loadRuntime(config, { fresh = false } = {}) {
 
     const [registryMarket, gatewayCode, quoterCode] = await Promise.all([
       safeRead(client, {
-        address: config.registryAddress,
+        address: registryAddress,
         abi: REGISTRY_ABI,
         functionName: "isMarket",
         args: [gatewayAddress],
@@ -333,7 +449,7 @@ export async function loadRuntime(config, { fresh = false } = {}) {
       && same(projectAdapter, projectAdapterAddress)
       && same(stockAdapter, stockAdapterAddress)
       && same(eligibilityChecker, eligibilityCheckerAddress)
-      && same(guardian, config.registryAddress)
+      && same(guardian, registryAddress)
       && same(inputToken, CANONICAL_WETH)
       && Number(explicitFeeBps) === 0
       && same(feeRecipient, zeroAddress)
@@ -377,8 +493,8 @@ export async function loadRuntime(config, { fresh = false } = {}) {
       && same(stockInput, inputToken)
       && same(projectOutput, officialToken)
       && same(stockOutput, stockToken)
-      && same(projectRegistry, config.registryAddress)
-      && same(stockRegistry, config.registryAddress)
+      && same(projectRegistry, registryAddress)
+      && same(stockRegistry, registryAddress)
       && same(projectRouter, CANONICAL_SWAP_ROUTER)
       && same(stockRouter, CANONICAL_SWAP_ROUTER)
       && same(projectQuoter, CANONICAL_QUOTER)
@@ -389,7 +505,6 @@ export async function loadRuntime(config, { fresh = false } = {}) {
     checks.quoteRoutes = exactRoute(projectPath, [CANONICAL_WETH, officialToken], [10_000])
       && exactRoute(stockPath, [CANONICAL_WETH, CANONICAL_USDG, CANONICAL_QQQ], [100, 3_000]);
 
-    checks.eligibilityProvider = providerConfigured(config);
     const [checkerCode, checkerSigner, checkerPolicyHash, checkerAdmin] = await Promise.all([
       bytecode(client, eligibilityChecker),
       safeRead(client, {
@@ -413,20 +528,43 @@ export async function loadRuntime(config, { fresh = false } = {}) {
       : null;
     checks.eligibilityChecker = Boolean(checkerCode)
       && same(checkerAdmin, projectAuthority)
-      && (!config.expectedEligibilityChecker || same(eligibilityChecker, config.expectedEligibilityChecker));
+      && (!expectedEligibilityChecker || same(eligibilityChecker, expectedEligibilityChecker));
     checks.eligibilitySigner = Boolean(configuredSignerAddress) && same(checkerSigner, configuredSignerAddress);
     checks.policyHash = /^0x[a-fA-F0-9]{64}$/.test(checkerPolicyHash || "")
       && !/^0x0{64}$/i.test(checkerPolicyHash)
-      && (!config.expectedEligibilityPolicyHash
-        || checkerPolicyHash.toLowerCase() === config.expectedEligibilityPolicyHash);
+      && (!expectedEligibilityPolicyHash
+        || checkerPolicyHash.toLowerCase() === expectedEligibilityPolicyHash);
+
+    if (production) {
+      checks.releaseManifest = releaseManifestConfigMatches(config, releaseManifest)
+        && releaseManifestSnapshotMatches({
+          chainId,
+          protocolVersion,
+          registryAddress,
+          projectAuthorityAddress: projectAuthority,
+          officialTokenAddress,
+          gatewayAddress,
+          activatedBlock,
+          implementationAddress: implementation,
+          implementationCodeHash: implementationCode ? keccak256(implementationCode) : null,
+          eligibilityCheckerAddress,
+          eligibilityAuthorityAddress: checkerSigner,
+          policyHash: checkerPolicyHash,
+          stockAdapterAddress,
+          maxAmountInWei: registryMaximum,
+          marketReady: registryMarket === true && registryReady === true,
+        }, releaseManifest);
+    }
 
     const ready = Object.values(checks).every(Boolean);
     const value = {
       ...base,
       ready,
       status: ready ? "READY" : "NOT_READY",
-      registryAddress: config.registryAddress,
-      factoryAddress: config.registryAddress,
+      protocolVersion: protocolVersion === null ? null : Number(protocolVersion),
+      registryAddress,
+      factoryAddress: registryAddress,
+      projectAuthorityAddress: projectAuthority || null,
       gatewayAddress,
       officialTokenAddress,
       stockTokenAddress: stockToken || config.stockTokenAddress,
@@ -434,11 +572,15 @@ export async function loadRuntime(config, { fresh = false } = {}) {
       projectAdapterAddress: projectAdapter || null,
       stockAdapterAddress: stockAdapter || null,
       explicitFeeBps: explicitFeeBps === null ? null : Number(explicitFeeBps),
+      onchainMaximumBuyWei: gatewayMaximum === null ? null : String(gatewayMaximum),
       activatedBlock,
       limits: publicLimits(config, BigInt(gatewayMaximum || 0n)),
       eligibilityCheckerAddress: eligibilityChecker || null,
       eligibilitySignerAddress: checkerSigner || null,
       policyHash: checkerPolicyHash || null,
+      marketRegistered: registryMarket === true,
+      gatewayInitializedOnchain: initialized === true,
+      gatewayPaused: paused === true,
       gatewayCodeHash: gatewayCode ? keccak256(gatewayCode) : null,
       implementationAddress: implementation || null,
       implementationCodeHash: implementationCode ? keccak256(implementationCode) : null,
@@ -446,6 +588,11 @@ export async function loadRuntime(config, { fresh = false } = {}) {
         projectPath: projectPathRaw || null,
         stockPath: stockPathRaw || null,
       },
+      releaseManifest: publicReleaseManifestState({
+        production,
+        manifest: releaseManifest,
+        bound: checks.releaseManifest,
+      }),
       checks,
     };
     runtimeCache.set(key, { expiresAtMs, value });

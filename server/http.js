@@ -1,16 +1,15 @@
 import { getServerConfig } from "./config.js";
+import { ApiError } from "./errors.js";
+import {
+  consumeDistributedRateLimit,
+  emitMonitoringEvent,
+  isMonitoringConfigured,
+} from "./operations.js";
+import { randomUUID } from "node:crypto";
+
+export { ApiError } from "./errors.js";
 
 const rateWindows = new Map();
-
-export class ApiError extends Error {
-  constructor(status, code, message, details = undefined) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-    this.code = code;
-    this.details = details;
-  }
-}
 
 function header(req, name) {
   if (typeof req.headers?.get === "function") return req.headers.get(name);
@@ -44,6 +43,11 @@ function applyCommonHeaders(req, res, config) {
 
 function consumeRateLimit(key, maximum, windowMs) {
   const now = Date.now();
+  if (rateWindows.size > 10_000) {
+    for (const [entryKey, entry] of rateWindows) {
+      if (entry.resetAt <= now) rateWindows.delete(entryKey);
+    }
+  }
   const current = rateWindows.get(key);
   if (!current || current.resetAt <= now) {
     rateWindows.set(key, { count: 1, resetAt: now + windowMs });
@@ -55,6 +59,11 @@ function consumeRateLimit(key, maximum, windowMs) {
     remaining: Math.max(0, maximum - current.count),
     resetAt: current.resetAt,
   };
+}
+
+function requestId(req) {
+  const supplied = String(header(req, "x-request-id") || "").trim();
+  return /^[A-Za-z0-9._:-]{1,128}$/.test(supplied) ? supplied : randomUUID();
 }
 
 async function readJson(req, maximumBytes = 16_384) {
@@ -96,11 +105,14 @@ export function createApiHandler({
   rateWindowMs = 60_000,
   cacheControl = "no-store",
   body = false,
+  runtimeSurface = false,
 }, action) {
   const allowedMethods = new Set(methods);
   return async function apiHandler(req, res) {
     const config = getServerConfig();
     const origin = applyCommonHeaders(req, res, config);
+    const correlationId = requestId(req);
+    res.setHeader("x-request-id", correlationId);
     res.setHeader("cache-control", cacheControl);
 
     if (req.method === "OPTIONS") {
@@ -119,7 +131,27 @@ export function createApiHandler({
       return send(res, 405, { ok: false, error: { code: "METHOD_NOT_ALLOWED", message: "Method is not allowed." } });
     }
 
-    const rate = consumeRateLimit(`${name}:${getClientIp(req)}`, rateLimit, rateWindowMs);
+    let rate = consumeRateLimit(`${name}:${getClientIp(req)}`, rateLimit, rateWindowMs);
+    try {
+      if (config.vercelEnvironment === "production" && !runtimeSurface) {
+        if (!isMonitoringConfigured(config)) {
+          throw new ApiError(503, "MONITORING_NOT_CONFIGURED", "Production monitoring is required.");
+        }
+        rate = await consumeDistributedRateLimit(config, {
+          key: `${name}:${getClientIp(req)}`,
+          maximum: rateLimit,
+          windowMs: rateWindowMs,
+        });
+      }
+    } catch (error) {
+      const code = error instanceof ApiError ? error.code : "RATE_LIMIT_UNAVAILABLE";
+      console.error(JSON.stringify({ level: "error", name, code, requestId: correlationId }));
+      await emitMonitoringEvent(config, { level: "error", name, code, requestId: correlationId });
+      return send(res, 503, {
+        ok: false,
+        error: { code: "SERVICE_UNAVAILABLE", message: "The service is temporarily unavailable." },
+      });
+    }
     res.setHeader("x-ratelimit-limit", String(rateLimit));
     res.setHeader("x-ratelimit-remaining", String(rate.remaining));
     res.setHeader("x-ratelimit-reset", String(Math.ceil(rate.resetAt / 1_000)));
@@ -141,7 +173,13 @@ export function createApiHandler({
     } catch (error) {
       if (error instanceof ApiError) {
         if (error.status >= 500) {
-          console.error(`[${name}] ${error.code}: ${error.message}`);
+          console.error(JSON.stringify({ level: "error", name, code: error.code, requestId: correlationId }));
+          await emitMonitoringEvent(config, {
+            level: "error",
+            name,
+            code: error.code,
+            requestId: correlationId,
+          });
           return send(res, error.status, {
             ok: false,
             error: {
@@ -155,7 +193,13 @@ export function createApiHandler({
           error: { code: error.code, message: error.message, ...(error.details ? { details: error.details } : {}) },
         });
       }
-      console.error(`[${name}]`, error instanceof Error ? error.message : "Unknown server error");
+      console.error(JSON.stringify({ level: "error", name, code: "INTERNAL_ERROR", requestId: correlationId }));
+      await emitMonitoringEvent(config, {
+        level: "error",
+        name,
+        code: "INTERNAL_ERROR",
+        requestId: correlationId,
+      });
       return send(res, 500, {
         ok: false,
         error: { code: "INTERNAL_ERROR", message: "The service failed closed." },

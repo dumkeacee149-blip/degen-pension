@@ -46,7 +46,7 @@ export function holderStatsBinding(runtime) {
 export function useHolderStats(runtime, refreshToken = 0) {
   const [stats, setStats] = useState(UNAVAILABLE_STATS);
   const officialTokenAddress = holderStatsBinding(runtime);
-  const enabled = Boolean(officialTokenAddress || MARKET.holderStatsEndpoint);
+  const enabled = Boolean(officialTokenAddress && MARKET.holderStatsEndpoint);
 
   useEffect(() => {
     if (!enabled) {

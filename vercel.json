@@ -4,9 +4,12 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist/client",
   "functions": {
-    "api/*.js": {
-      "maxDuration": 10
-    }
+    "api/runtime.js": { "maxDuration": 30 },
+    "api/quote.js": { "maxDuration": 30 },
+    "api/holders.js": { "maxDuration": 30 },
+    "api/members.js": { "maxDuration": 30 },
+    "api/holder-stock.js": { "maxDuration": 30 },
+    "api/eligibility.js": { "maxDuration": 15 }
   },
   "rewrites": [
     { "source": "/((?!api/|assets/|brand/|social/).*)", "destination": "/index.html" }

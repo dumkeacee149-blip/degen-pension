@@ -1,3 +1,5 @@
+import { PRODUCTION_DEPLOYMENT } from "./productionDeployment.js";
+
 export const ROBINHOOD_CHAIN = Object.freeze({
   chainId: "0x1237",
   chainIdDecimal: 4663,
@@ -12,20 +14,40 @@ export const STOCK_TOKEN = Object.freeze({
   name: "Invesco QQQ • Robinhood Token",
   address: "0xD5f3879160bc7c32ebb4dC785F8a4F505888de68",
   chainId: 4663,
+  decimals: 18,
   statusAtVerification: "ASSET_STATUS_ACTIVE",
   verifiedAt: "2026-07-24T23:56:00+08:00",
   registryUrl: "https://api.robinhood.com/rhj/assets",
 });
 
+export const STOCK_PROOF_ROUTE = Object.freeze({
+  settlementTokenSymbol: "USDG",
+  settlementTokenAddress: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+  settlementTokenDecimals: 6,
+  settlementPoolAddress: "0xEbD78dcfc8a6b3A696f1E191aD1ff321f9579f79",
+});
+
 const isDevelopment = Boolean(import.meta.env.DEV);
 const devValue = (name) => isDevelopment ? String(import.meta.env[name] || "").trim() : "";
-const gatewayAddress = devValue("VITE_GATEWAY_ADDRESS");
-const officialTokenAddress = devValue("VITE_OFFICIAL_TOKEN_ADDRESS");
-const factoryAddress = devValue("VITE_MARKET_FACTORY_ADDRESS");
+const gatewayAddress = isDevelopment
+  ? devValue("VITE_GATEWAY_ADDRESS")
+  : PRODUCTION_DEPLOYMENT.activeMarketAddress;
+const officialTokenAddress = isDevelopment
+  ? devValue("VITE_OFFICIAL_TOKEN_ADDRESS")
+  : PRODUCTION_DEPLOYMENT.officialTokenAddress;
+const factoryAddress = isDevelopment
+  ? devValue("VITE_MARKET_FACTORY_ADDRESS")
+  : PRODUCTION_DEPLOYMENT.registryAddress;
 const inputTokenAddress = devValue("VITE_INPUT_TOKEN_ADDRESS");
 const projectAdapterAddress = devValue("VITE_PROJECT_ADAPTER_ADDRESS");
-const stockAdapterAddress = devValue("VITE_STOCK_ADAPTER_ADDRESS");
-const activatedBlockValue = Number(devValue("VITE_GATEWAY_ACTIVATED_BLOCK") || 0);
+const stockAdapterAddress = isDevelopment
+  ? devValue("VITE_STOCK_ADAPTER_ADDRESS")
+  : PRODUCTION_DEPLOYMENT.stockAdapterAddress;
+const activatedBlockValue = Number(
+  isDevelopment
+    ? devValue("VITE_GATEWAY_ACTIVATED_BLOCK") || 0
+    : PRODUCTION_DEPLOYMENT.activatedBlock,
+);
 const confirmationsValue = Number(import.meta.env.VITE_LOG_CONFIRMATIONS || 12);
 const explicitFeeBpsText = devValue("VITE_EXPLICIT_FEE_BPS");
 const explicitFeeBpsValue = explicitFeeBpsText === "" ? null : Number(explicitFeeBpsText);
@@ -36,6 +58,7 @@ const eligibilityEndpoint = devValue("VITE_ELIGIBILITY_ENDPOINT") || "/api/eligi
 const buyQuoteEndpoint = devValue("VITE_BUY_QUOTE_ENDPOINT") || "/api/quote";
 const memberStatsEndpoint = devValue("VITE_MEMBER_STATS_ENDPOINT") || "/api/members";
 const holderStatsEndpoint = devValue("VITE_HOLDER_STATS_ENDPOINT") || "/api/holders";
+const holderStockStatsEndpoint = devValue("VITE_HOLDER_STOCK_STATS_ENDPOINT") || "/api/holder-stock";
 const requestTimeoutValue = Number(import.meta.env.VITE_REQUEST_TIMEOUT_MS || 8_000);
 const receiptTimeoutValue = Number(import.meta.env.VITE_RECEIPT_TIMEOUT_MS || 120_000);
 const runtimeMaxAgeValue = Number(import.meta.env.VITE_RUNTIME_MAX_AGE_MS || 120_000);
@@ -73,6 +96,7 @@ const bootstrapConfigured = Boolean(
   && isEndpoint(buyQuoteEndpoint)
   && isEndpoint(memberStatsEndpoint)
   && isEndpoint(holderStatsEndpoint)
+  && isEndpoint(holderStockStatsEndpoint)
 );
 
 export const MARKET = Object.freeze({
@@ -83,6 +107,20 @@ export const MARKET = Object.freeze({
   inputTokenAddress,
   projectAdapterAddress,
   stockAdapterAddress,
+  gatewayImplementationAddress: isDevelopment
+    ? ""
+    : PRODUCTION_DEPLOYMENT.gatewayImplementationAddress,
+  gatewayImplementationCodeHash: isDevelopment
+    ? ""
+    : PRODUCTION_DEPLOYMENT.gatewayImplementationCodeHash,
+  eligibilityCheckerAddress: isDevelopment
+    ? ""
+    : PRODUCTION_DEPLOYMENT.eligibilityCheckerAddress,
+  eligibilityPolicyHash: isDevelopment
+    ? ""
+    : PRODUCTION_DEPLOYMENT.eligibilityPolicyHash,
+  releaseManifestRequired: !isDevelopment,
+  releaseManifestActive: PRODUCTION_DEPLOYMENT.tradingActive,
   activatedBlock: validActivatedBlock ? activatedBlockValue : 0,
   confirmations: Number.isSafeInteger(confirmationsValue) && confirmationsValue >= 0
     ? confirmationsValue
@@ -91,6 +129,7 @@ export const MARKET = Object.freeze({
   slippageBps: validSlippageBps ? slippageBpsValue : 0,
   memberStatsEndpoint,
   holderStatsEndpoint,
+  holderStockStatsEndpoint,
   runtimeStatusEndpoint,
   eligibilityEndpoint,
   buyQuoteEndpoint,

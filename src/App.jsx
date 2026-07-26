@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
+  ArrowClockwise,
   ChartLineUp,
   Cloud,
   Cpu,
@@ -22,16 +23,117 @@ import {
 } from "./launchRuntime.js";
 import { loadMemberStats } from "./memberStats.js";
 import { useHolderStats } from "./useHolderStats.js";
+import { useHolderStockStats } from "./useHolderStockStats.js";
 import { useMemberStats } from "./useMemberStats.js";
 import { useRuntimeReadiness } from "./useRuntimeReadiness.js";
-import CodePage from "./CodePage.jsx";
-import FlowPage from "./FlowPage.jsx";
 
+const CodePage = lazy(() => import("./CodePage.jsx"));
+const FlowPage = lazy(() => import("./FlowPage.jsx"));
 const DeployPage = lazy(() => import("./DeployPage.jsx"));
+
+function RouteFallback() {
+  return (
+    <main className="route-fallback" aria-busy="true" aria-live="polite">
+      OPENING VERIFIED RECORD…
+    </main>
+  );
+}
 
 function shortAddress(value) {
   if (!value) return "";
   return `${value.slice(0, 6)}…${value.slice(-4)}`;
+}
+
+function formatGroupedDecimal(value) {
+  const [whole, fraction = ""] = String(value || "0").split(".");
+  const grouped = BigInt(whole || "0").toLocaleString("en-US");
+  return fraction ? `${grouped}.${fraction}` : grouped;
+}
+
+function formatProofTimestamp(value) {
+  if (!Number.isFinite(value)) return "UNAVAILABLE";
+  return new Date(value).toLocaleString("en-US", {
+    month: "short",
+    day: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "UTC",
+    timeZoneName: "short",
+  }).toUpperCase();
+}
+
+function useDialogA11y({ open, dialogRef, triggerRef, onClose }) {
+  const closeRef = useRef(onClose);
+  useEffect(() => {
+    closeRef.current = onClose;
+  }, [onClose]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const lastFocused = document.activeElement;
+    const background = [
+      document.querySelector(".home-header"),
+      document.querySelector(".home-main"),
+      document.querySelector(".home-footer"),
+    ].filter(Boolean);
+    const previousOverflow = document.body.style.overflow;
+    background.forEach((element) => {
+      element.inert = true;
+      element.setAttribute("aria-hidden", "true");
+    });
+    document.body.style.overflow = "hidden";
+
+    const focusableSelector = [
+      "button:not([disabled])",
+      "a[href]",
+      "input:not([disabled])",
+      "[tabindex]:not([tabindex='-1'])",
+    ].join(",");
+    const focusDialog = window.requestAnimationFrame(() => {
+      dialogRef.current?.querySelector(focusableSelector)?.focus();
+    });
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRef.current?.();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = [...dialogRef.current.querySelectorAll(focusableSelector)]
+        .filter((element) => !element.hidden && element.getClientRects().length > 0);
+      if (!focusable.length) {
+        event.preventDefault();
+        dialogRef.current.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusDialog);
+      window.removeEventListener("keydown", onKeyDown);
+      background.forEach((element) => {
+        element.inert = false;
+        element.removeAttribute("aria-hidden");
+      });
+      document.body.style.overflow = previousOverflow;
+      const focusTarget = lastFocused?.isConnected
+        ? lastFocused
+        : triggerRef.current?.isConnected
+          ? triggerRef.current
+          : null;
+      focusTarget?.focus();
+    };
+  }, [open, dialogRef, triggerRef]);
 }
 
 function splitAmount(value, ratio, explicitFeeBps = MARKET.explicitFeeBps) {
@@ -70,7 +172,7 @@ function validateAmount(value, limits) {
 function sanitizeAmount(value) {
   const clean = value.replace(/[^0-9.]/g, "");
   const [whole, ...fraction] = clean.split(".");
-  return fraction.length ? `${whole}.${fraction.join("").slice(0, 6)}` : whole;
+  return fraction.length ? `${whole}.${fraction.join("").slice(0, 18)}` : whole;
 }
 
 const BUSY_ACTION_STATES = new Set([
@@ -94,15 +196,15 @@ function actionLabel(state, hasAmount) {
 
 function runtimeMessage(runtime) {
   if (!MARKET.bootstrapConfigured) {
-    return "MARKET BLOCKED · OFFICIAL RUNTIME, QUOTE, AND ELIGIBILITY CONFIGURATION IS INCOMPLETE.";
+    return "MARKET BLOCKED · ONE OR MORE REQUIRED PRODUCTION SERVICES OR CONTROLS ARE NOT CONFIGURED.";
   }
   if (runtime.status === "checking") {
-    return "MARKET CHECKING · QUOTE CHECKING · ELIGIBILITY SERVICE CHECKING. NO WALLET REQUEST YET.";
+    return "PRODUCTION CHECKS RUNNING · NO WALLET REQUEST YET.";
   }
   if (!runtime.ready) {
     return `MARKET BLOCKED · ${String(runtime.reason || "A REQUIRED SAFETY CHECK FAILED.").toUpperCase()}`;
   }
-  return "MARKET READY · QUOTE READY · ELIGIBILITY SERVICE READY. YOUR WALLET IS CHECKED ONLY AFTER YOU CONNECT.";
+  return "MARKET CONTROLS AND QUOTE ROUTE ARE READY. AN EXACT QUOTE AND FULL SIMULATION RUN ONLY AFTER AMOUNT AND ELIGIBILITY CHECKS.";
 }
 
 function eligibilityMessage(eligibility) {
@@ -220,11 +322,16 @@ function HomePage() {
   const stage = getPublicStage(holderStats);
   const [amount, setAmount] = useState("");
   const [isBuySheetOpen, setIsBuySheetOpen] = useState(false);
+  const [isHolderStockDialogOpen, setIsHolderStockDialogOpen] = useState(false);
   const [actionState, setActionState] = useState("idle");
   const [actionMessage, setActionMessage] = useState("");
   const [submittedHash, setSubmittedHash] = useState("");
   const [receiptWallet, setReceiptWallet] = useState("");
+  const [receiptGateway, setReceiptGateway] = useState("");
+  const [receiptConfirmedBlock, setReceiptConfirmedBlock] = useState(null);
   const [receiptMemberNumber, setReceiptMemberNumber] = useState(null);
+  const [receiptMemberStatus, setReceiptMemberStatus] = useState("idle");
+  const [receiptMemberMessage, setReceiptMemberMessage] = useState("");
   const [walletAccount, setWalletAccount] = useState("");
   const [walletChainId, setWalletChainId] = useState("");
   const [termsAccepted, setTermsAccepted] = useState(false);
@@ -241,14 +348,27 @@ function HomePage() {
   const flowWalletRef = useRef("");
   const expectedChainRef = useRef("");
   const submittedHashRef = useRef("");
+  const receiptVerificationRef = useRef(null);
   const buyDialogRef = useRef(null);
   const buyTriggerRef = useRef(null);
-  const lastFocusedRef = useRef(null);
+  const holderStockDialogRef = useRef(null);
+  const holderStockTriggerRef = useRef(null);
   const isBusyRef = useRef(false);
   const actionStateRef = useRef("idle");
   const isBusy = BUSY_ACTION_STATES.has(actionState);
   const runtimeReady = MARKET.bootstrapConfigured && runtime.ready;
   const officialTokenAddress = runtime.canonical?.officialTokenAddress || "";
+  const officialGatewayAddress = runtime.canonical?.gatewayAddress || "";
+  const officialActivatedBlock = runtime.canonical?.activatedBlock || 0;
+  const holderStockBindingReady = Boolean(
+    officialTokenAddress && officialGatewayAddress && officialActivatedBlock,
+  );
+  const holderStockProof = useHolderStockStats({
+    open: isHolderStockDialogOpen,
+    officialTokenAddress,
+    gatewayAddress: officialGatewayAddress,
+    activatedBlock: officialActivatedBlock,
+  });
   const previewFeeBps = runtime.canonical?.explicitFeeBps ?? MARKET.explicitFeeBps ?? 0;
   const showMemberTicket = runtimeReady
     && ["ready", "empty", "stale"].includes(stats.status)
@@ -266,6 +386,42 @@ function HomePage() {
     && termsAccepted
     && notUSPerson
     && !isBusy;
+  const receiptFailed = Boolean(submittedHash) && actionState === "error";
+  const holderStockProofReady = ["ready", "empty", "stale"].includes(holderStockProof.status)
+    && holderStockProof.approximateUsdValue !== null;
+  const holderStockCardValue = holderStockProof.status === "error"
+    ? "UNAVAILABLE"
+    : holderStockProof.status === "activation_pending"
+      ? "CONFIRMING CA"
+    : holderStockProofReady
+      ? `≈$${formatGroupedDecimal(holderStockProof.approximateUsdValue)}`
+      : holderStockProof.status === "loading"
+        ? "VERIFYING"
+        : holderStockBindingReady
+          ? "OPEN"
+          : officialTokenAddress
+            ? "BINDING PENDING"
+            : "CA PENDING";
+  const holderStockCardKicker = holderStockProof.status === "stale"
+    ? "LAST VERIFIED · STALE"
+    : holderStockProof.status === "error"
+      ? "CALCULATION UNAVAILABLE"
+      : holderStockProof.status === "activation_pending"
+        ? "ACTIVATION AWAITING CONFIRMATIONS"
+      : "OFFICIAL 99/1 SELF-BUY CALCULATION";
+  const holderStockCardCopy = holderStockProof.status === "stale"
+    ? holderStockProof.error
+      ? "REFRESH FAILED · OPEN FOR LAST VERIFIED INPUTS AND RETRY"
+      : "PROOF EXPIRED · OPEN TO REFRESH THE CONFIRMED TOTAL"
+    : holderStockProof.status === "error"
+      ? "OPEN TO RETRY THE COMPLETE ONCHAIN VERIFICATION"
+      : holderStockProof.status === "activation_pending"
+        ? "THE ACTIVATION BLOCK IS NOT CONFIRMATION-SAFE YET"
+      : holderStockBindingReady
+        ? "OPEN THE VERIFIED INPUTS, FORMULA & ONCHAIN SOURCES"
+        : officialTokenAddress
+          ? "WAITING FOR CANONICAL GATEWAY BINDING · NO ESTIMATE SHOWN"
+          : "WAITING FOR THE OFFICIAL CA · NO ESTIMATE SHOWN";
 
   const closeBuyDialog = () => {
     if (actionStateRef.current === "submitting") return;
@@ -276,6 +432,20 @@ function HomePage() {
     }
     setIsBuySheetOpen(false);
   };
+  const closeHolderStockDialog = () => setIsHolderStockDialogOpen(false);
+
+  useDialogA11y({
+    open: isBuySheetOpen,
+    dialogRef: buyDialogRef,
+    triggerRef: buyTriggerRef,
+    onClose: closeBuyDialog,
+  });
+  useDialogA11y({
+    open: isHolderStockDialogOpen,
+    dialogRef: holderStockDialogRef,
+    triggerRef: holderStockTriggerRef,
+    onClose: closeHolderStockDialog,
+  });
 
   useEffect(() => {
     document.title = "DEGEN PENSION - 99% APE. 1% ADULT.";
@@ -377,69 +547,13 @@ function HomePage() {
   }, []);
 
   useEffect(() => {
-    if (!isBuySheetOpen) return undefined;
-    lastFocusedRef.current = document.activeElement;
-    const background = [
-      document.querySelector(".home-header"),
-      document.querySelector(".home-main"),
-      document.querySelector(".home-footer"),
-    ].filter(Boolean);
-    const previousOverflow = document.body.style.overflow;
-    background.forEach((element) => {
-      element.inert = true;
-      element.setAttribute("aria-hidden", "true");
-    });
-    document.body.style.overflow = "hidden";
-
-    const focusableSelector = [
-      "button:not([disabled])",
-      "a[href]",
-      "input:not([disabled])",
-      "[tabindex]:not([tabindex='-1'])",
-    ].join(",");
-    const focusDialog = window.requestAnimationFrame(() => {
-      buyDialogRef.current?.querySelector(focusableSelector)?.focus();
-    });
-    const onKeyDown = (event) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        closeBuyDialog();
-        return;
-      }
-      if (event.key !== "Tab" || !buyDialogRef.current) return;
-      const focusable = [...buyDialogRef.current.querySelectorAll(focusableSelector)]
-        .filter((element) => !element.hidden && element.getClientRects().length > 0);
-      if (!focusable.length) {
-        event.preventDefault();
-        buyDialogRef.current.focus();
-        return;
-      }
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.cancelAnimationFrame(focusDialog);
-      window.removeEventListener("keydown", onKeyDown);
-      background.forEach((element) => {
-        element.inert = false;
-        element.removeAttribute("aria-hidden");
-      });
-      document.body.style.overflow = previousOverflow;
-      const focusTarget = lastFocusedRef.current || buyTriggerRef.current;
-      if (focusTarget?.isConnected) focusTarget.focus();
-    };
-  }, [isBuySheetOpen]);
-
-  useEffect(() => {
-    if (actionState !== "success" || !receiptWallet || !submittedHash) return undefined;
+    if (
+      actionState !== "success"
+      || !receiptWallet
+      || !receiptGateway
+      || !Number.isSafeInteger(receiptConfirmedBlock)
+      || !submittedHash
+    ) return undefined;
     const controller = new AbortController();
     let interval;
     const refreshMemberRecord = async () => {
@@ -447,23 +561,60 @@ function HomePage() {
         const next = await loadMemberStats({
           signal: controller.signal,
           recipient: receiptWallet,
-          gatewayAddress: runtime.canonical?.gatewayAddress,
+          gatewayAddress: receiptGateway,
         });
-        if (next.memberNumber) {
+        if (next.memberNumber && next.asOfBlock >= receiptConfirmedBlock) {
           setReceiptMemberNumber(next.memberNumber);
+          setReceiptMemberStatus("ready");
+          setReceiptMemberMessage(`CANONICAL MEMBER INDEX VERIFIED THROUGH BLOCK ${next.asOfBlock}.`);
           if (interval) window.clearInterval(interval);
+          return;
         }
+        setReceiptMemberNumber(null);
+        setReceiptMemberStatus("indexing");
+        setReceiptMemberMessage(
+          next.asOfBlock < receiptConfirmedBlock
+            ? `MEMBER INDEX IS AT BLOCK ${next.asOfBlock}; RECEIPT CONFIRMED AT ${receiptConfirmedBlock}.`
+            : "CONFIRMED RECEIPT FOUND. CANONICAL MEMBER NUMBER HAS NOT BEEN INDEXED YET.",
+        );
       } catch (error) {
-        if (error?.name !== "AbortError") setReceiptMemberNumber(null);
+        if (error?.name !== "AbortError") {
+          setReceiptMemberNumber(null);
+          setReceiptMemberStatus("unavailable");
+          setReceiptMemberMessage("MEMBER INDEX UNAVAILABLE. THE CONFIRMED ONCHAIN RECEIPT REMAINS VERIFIABLE.");
+        }
       }
     };
-    refreshMemberRecord();
+    setReceiptMemberStatus("indexing");
+    setReceiptMemberMessage("WAITING FOR THE CONFIRMED MEMBER INDEX TO REACH THIS RECEIPT.");
+    void refreshMemberRecord();
     interval = window.setInterval(refreshMemberRecord, 15_000);
     return () => {
       controller.abort();
       if (interval) window.clearInterval(interval);
     };
-  }, [actionState, receiptWallet, runtime.canonical?.gatewayAddress, submittedHash]);
+  }, [actionState, receiptConfirmedBlock, receiptGateway, receiptWallet, submittedHash]);
+
+  const acceptConfirmedReceipt = (confirmedReceipt, transactionHash) => {
+    let confirmedBlock;
+    try {
+      confirmedBlock = Number(BigInt(confirmedReceipt.blockNumber));
+    } catch {
+      confirmedBlock = null;
+    }
+    if (!Number.isSafeInteger(confirmedBlock) || confirmedBlock <= 0) {
+      const invalidReceipt = new Error("Confirmed receipt block is invalid.");
+      invalidReceipt.code = "INVALID_RECEIPT";
+      throw invalidReceipt;
+    }
+    setReceiptConfirmedBlock(confirmedBlock);
+    setReceiptMemberStatus("indexing");
+    setReceiptMemberMessage("WAITING FOR THE CONFIRMED MEMBER INDEX TO REACH THIS RECEIPT.");
+    setActionState("success");
+    setActionMessage(`CONFIRMED ${shortAddress(transactionHash)}. BOTH LEGS SETTLED OR NEITHER.`);
+    setStatsRefreshToken((value) => value + 1);
+    void runtime.refresh({ quiet: true });
+  };
 
   const buy = async () => {
     if (!canBuy || submitLockRef.current) return;
@@ -483,21 +634,34 @@ function HomePage() {
     submittedHashRef.current = "";
     setSubmittedHash("");
     setReceiptWallet("");
+    setReceiptGateway("");
+    setReceiptConfirmedBlock(null);
     setReceiptMemberNumber(null);
+    setReceiptMemberStatus("idle");
+    setReceiptMemberMessage("");
+    receiptVerificationRef.current = null;
     const controller = new AbortController();
     activeOperationRef.current?.abort();
     activeOperationRef.current = controller;
+    const throwIfInterrupted = () => {
+      if (controller.signal.aborted || activeOperationRef.current !== controller) {
+        const error = new Error("Purchase was interrupted before wallet submission.");
+        error.code = "ABORTED";
+        throw error;
+      }
+    };
     try {
       setActionState("connecting");
       const liveRuntime = await runtime.refresh();
+      throwIfInterrupted();
       if (!liveRuntime?.ready) {
-        throw new Error(liveRuntime?.reason || "Runtime, quote, and eligibility are not all ready.");
+        throw new Error(liveRuntime?.reason || "One or more production checks are not ready.");
       }
 
       const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+      throwIfInterrupted();
       const wallet = normalizeAddress(accounts?.[0], "Connected wallet");
       if (!wallet) throw new Error("Wallet connection was cancelled.");
-      if (controller.signal.aborted) throw new Error("Purchase was interrupted.");
       flowWalletRef.current = wallet;
       setWalletAccount(wallet);
 
@@ -511,6 +675,7 @@ function HomePage() {
         notUSPerson,
         signal: controller.signal,
       });
+      throwIfInterrupted();
       if (!eligibilityResult.eligible) {
         setEligibility({
           status: "ineligible",
@@ -550,11 +715,13 @@ function HomePage() {
           expectedChainRef.current = "";
         }
       }
+      throwIfInterrupted();
 
       const [accountsBeforeQuote, chainBeforeQuote] = await Promise.all([
         window.ethereum.request({ method: "eth_accounts" }),
         window.ethereum.request({ method: "eth_chainId" }),
       ]);
+      throwIfInterrupted();
       if (
         normalizeAddress(accountsBeforeQuote?.[0], "Active wallet") !== wallet
         || normalizeChainId(chainBeforeQuote) !== CHAIN.chainIdDecimal
@@ -573,10 +740,12 @@ function HomePage() {
         notUSPerson,
         signal: controller.signal,
       });
+      throwIfInterrupted();
       const [accountsBeforeSend, chainBeforeSend] = await Promise.all([
         window.ethereum.request({ method: "eth_accounts" }),
         window.ethereum.request({ method: "eth_chainId" }),
       ]);
+      throwIfInterrupted();
       const now = Date.now();
       if (
         normalizeAddress(accountsBeforeSend?.[0], "Active wallet") !== wallet
@@ -588,7 +757,9 @@ function HomePage() {
         throw new Error("Wallet, eligibility, runtime, or quote changed before submission.");
       }
 
+      throwIfInterrupted();
       setActionState("submitting");
+      actionStateRef.current = "submitting";
       const transactionHash = await window.ethereum.request({
         method: "eth_sendTransaction",
         params: [{
@@ -598,24 +769,35 @@ function HomePage() {
           value: executableQuote.transaction.value,
         }],
       });
+      if (!/^0x[a-fA-F0-9]{64}$/.test(String(transactionHash || ""))) {
+        throw new Error("Wallet returned an invalid transaction hash.");
+      }
       submittedHashRef.current = transactionHash;
+      const receiptConfirmations = liveRuntime.limits?.confirmations || MARKET.confirmations || 1;
+      receiptVerificationRef.current = {
+        wallet,
+        gatewayAddress: liveRuntime.canonical.gatewayAddress,
+        transaction: executableQuote.transaction,
+        confirmations: receiptConfirmations,
+      };
       setSubmittedHash(transactionHash);
       setReceiptWallet(wallet);
+      setReceiptGateway(liveRuntime.canonical.gatewayAddress);
       setActionState("confirming");
+      actionStateRef.current = "confirming";
       setActionMessage(`SUBMITTED ${shortAddress(transactionHash)}. WAITING FOR THE ATOMIC RECEIPT.`);
 
-      await waitForTransactionReceipt({
-        ethereum: window.ethereum,
+      const confirmedReceipt = await waitForTransactionReceipt({
+        rpcUrl: CHAIN.rpcUrls[0],
         hash: transactionHash,
         gatewayAddress: liveRuntime.canonical.gatewayAddress,
-        confirmations: liveRuntime.limits?.confirmations || MARKET.confirmations || 1,
+        wallet,
+        transaction: executableQuote.transaction,
+        confirmations: receiptConfirmations,
         signal: controller.signal,
         timeoutMs: MARKET.receiptTimeoutMs,
       });
-      setActionState("success");
-      setActionMessage(`CONFIRMED ${shortAddress(transactionHash)}. BOTH LEGS SETTLED OR NEITHER.`);
-      setStatsRefreshToken((value) => value + 1);
-      runtime.refresh({ quiet: true });
+      acceptConfirmedReceipt(confirmedReceipt, transactionHash);
     } catch (error) {
       const confirmedFailure = ["TRANSACTION_REVERTED", "INVALID_RECEIPT", "INVALID_HASH"]
         .includes(error?.code);
@@ -637,18 +819,63 @@ function HomePage() {
     }
   };
 
+  const recheckReceipt = async () => {
+    if (actionState !== "pending" || submitLockRef.current || !submittedHash) return;
+    const binding = receiptVerificationRef.current;
+    if (!binding) {
+      setActionState("error");
+      setActionMessage("THE ORIGINAL QUOTE BINDING IS UNAVAILABLE. THIS HASH CANNOT UNLOCK A RECEIPT.");
+      return;
+    }
+    if (navigator.onLine === false) {
+      setActionMessage("YOU ARE OFFLINE. THE HASH REMAINS PENDING UNTIL THE STRICT RECEIPT CHECK CAN RUN AGAIN.");
+      return;
+    }
+
+    submitLockRef.current = true;
+    const controller = new AbortController();
+    activeOperationRef.current?.abort();
+    activeOperationRef.current = controller;
+    setActionState("confirming");
+    setActionMessage(`RECHECKING ${shortAddress(submittedHash)} AGAINST THE ORIGINAL WALLET AND EXACT QUOTE.`);
+    try {
+      const confirmedReceipt = await waitForTransactionReceipt({
+        rpcUrl: CHAIN.rpcUrls[0],
+        hash: submittedHash,
+        gatewayAddress: binding.gatewayAddress,
+        wallet: binding.wallet,
+        transaction: binding.transaction,
+        confirmations: binding.confirmations,
+        signal: controller.signal,
+        timeoutMs: MARKET.receiptTimeoutMs,
+      });
+      acceptConfirmedReceipt(confirmedReceipt, submittedHash);
+    } catch (error) {
+      const confirmedFailure = ["TRANSACTION_REVERTED", "INVALID_RECEIPT", "INVALID_HASH"]
+        .includes(error?.code);
+      setActionState(confirmedFailure ? "error" : "pending");
+      setActionMessage(
+        confirmedFailure
+          ? String(error?.message || "THE SUBMITTED HASH FAILED STRICT RECEIPT VERIFICATION.").toUpperCase()
+          : `${String(error?.message || "CONFIRMATION IS STILL PENDING.").toUpperCase()} CHECK AGAIN WITHOUT RESUBMITTING.`,
+      );
+    } finally {
+      if (activeOperationRef.current === controller) activeOperationRef.current = null;
+      submitLockRef.current = false;
+    }
+  };
+
   const shareReceipt = async () => {
     if (!submittedHash) return;
-    if (actionState === "error") {
-      setActionMessage("THIS TRANSACTION DID NOT CONFIRM. SHARING AS A 99/1 RECEIPT IS DISABLED.");
+    if (actionState !== "success") {
+      setActionMessage("SHARING UNLOCKS ONLY AFTER THE OFFICIAL GATEWAY RECEIPT REACHES THE REQUIRED CONFIRMATIONS.");
       return;
     }
     const explorerUrl = `${CHAIN.blockExplorerUrls[0]}/tx/${submittedHash}`;
-    const isConfirmed = actionState === "success";
-    const memberText = receiptMemberNumber ? ` Official member #${receiptMemberNumber}.` : "";
-    const receiptText = isConfirmed
-      ? `My confirmed 99/1 pension receipt: 99% $401KEK, 1% QQQ.${memberText} ${explorerUrl}`
-      : `My 99/1 pension receipt is pending confirmation: 99% $401KEK, 1% QQQ. ${explorerUrl}`;
+    const memberText = receiptMemberStatus === "ready" && receiptMemberNumber
+      ? ` Official member #${receiptMemberNumber}.`
+      : "";
+    const receiptText = `My confirmed 99/1 pension receipt: 99% $401KEK, 1% QQQ.${memberText} ${explorerUrl}`;
     try {
       if (navigator.share) {
         await navigator.share({ title: "DEGEN PENSION RECEIPT", text: receiptText });
@@ -656,11 +883,9 @@ function HomePage() {
         await navigator.clipboard.writeText(receiptText);
       }
       setActionMessage(
-        isConfirmed
-          ? receiptMemberNumber
-            ? `CONFIRMED RECEIPT #${receiptMemberNumber} SHARED.`
-            : "CONFIRMED RECEIPT SHARED. MEMBER NUMBER IS STILL INDEXING."
-          : "PENDING RECEIPT SHARED. MEMBER NUMBER PRINTS ONLY FROM THE CONFIRMED INDEX.",
+        receiptMemberStatus === "ready" && receiptMemberNumber
+          ? `CONFIRMED RECEIPT #${receiptMemberNumber} SHARED.`
+          : "CONFIRMED RECEIPT SHARED. NO MEMBER NUMBER WAS PRINTED WITHOUT A CURRENT CANONICAL INDEX.",
       );
     } catch (error) {
       if (error?.name !== "AbortError") setActionMessage("COULD NOT SHARE. THE EXPLORER LINK IS STILL AVAILABLE BELOW.");
@@ -668,9 +893,14 @@ function HomePage() {
   };
 
   const sharePlan = async () => {
+    const text = runtimeReady
+      ? "A retirement plan for people who buy meme coins: 99% $401KEK, 1% QQQ. 99% APE. 1% ADULT."
+      : MARKET.releaseManifestActive
+        ? "The 99/1 market is recorded onchain, but public release gates are still blocked: 99% $401KEK, 1% QQQ."
+        : "A pre-launch 99/1 split-buy idea: 99% $401KEK, 1% QQQ. Market not active. 99% APE. 1% ADULT.";
     const shareData = {
       title: "DEGEN PENSION",
-      text: "A retirement plan for people who buy meme coins: 99% $401KEK, 1% QQQ. 99% APE. 1% ADULT.",
+      text,
       url: window.location.origin,
     };
 
@@ -710,17 +940,21 @@ function HomePage() {
             <span>CA:</span>
             <code>{officialTokenAddress || "PENDING"}</code>
           </div>
-          <aside
+          <button
+            ref={holderStockTriggerRef}
             className="holder-stock-snapshot"
-            aria-label="Public snapshot: project holders have bought 483,291 dollars of Stock Tokens for themselves. This is not DEGEN PENSION Gateway volume."
+            type="button"
+            aria-haspopup="dialog"
+            aria-controls="holder-stock-dialog"
+            onClick={() => setIsHolderStockDialogOpen(true)}
           >
-            <span className="holder-stock-snapshot-kicker">PUBLIC HOLDER SNAPSHOT</span>
-            <div className="holder-stock-snapshot-main">
-              <strong>$483,291</strong>
-              <span>IN STOCK TOKENS BOUGHT BY PROJECT HOLDERS FOR THEMSELVES</span>
-            </div>
-            <small>PUBLIC AGGREGATE · NOT 99/1 GATEWAY VOLUME</small>
-          </aside>
+            <span className="holder-stock-snapshot-kicker">{holderStockCardKicker}</span>
+            <span className="holder-stock-snapshot-main">
+              <strong>{holderStockCardValue}</strong>
+              <span>QQQ BOUGHT THROUGH CONFIRMED SELF-DIRECTED 99/1 TRADES</span>
+            </span>
+            <small>{holderStockCardCopy}</small>
+          </button>
           <div className="raccoon-media">
             <img className="raccoon-art" src={stage.art} alt="The tired deadpan office raccoon reacting to the current official member stage" />
             <span className="raccoon-form">{stage.form}</span>
@@ -731,7 +965,11 @@ function HomePage() {
           <section className={`buy-panel buy-panel-preview${showMemberTicket ? "" : " buy-panel-prelaunch"}`} aria-labelledby="buy-panel-title">
             <div className="buy-panel-title" id="buy-panel-title">
               <span>YOUR 99/1 RECEIPT</span>
-              <b>{runtimeReady ? "ONCHAIN" : "MARKET NOT ACTIVE"}</b>
+              <b>{runtimeReady
+                ? "ONCHAIN"
+                : MARKET.releaseManifestActive
+                  ? "BUY ROUTE BLOCKED"
+                  : "MARKET NOT ACTIVE"}</b>
             </div>
 
             {showMemberTicket ? (
@@ -748,7 +986,11 @@ function HomePage() {
             <div className="allocation allocation-project">
               <div><strong>99%</strong><span>$401KEK</span></div>
               <img src="/assets/badge-401kek-v1.webp" alt="401KEK black circle badge" />
-              <small>{runtimeReady ? "OF NET INPUT BUYS THE OFFICIAL MEME" : "PLANNED PROJECT LEG · MARKET NOT ACTIVE"}</small>
+              <small>{runtimeReady
+                ? "OF NET INPUT BUYS THE OFFICIAL MEME"
+                : MARKET.releaseManifestActive
+                  ? "PROJECT LEG · LIVE RELEASE GATES BLOCKED"
+                  : "PLANNED PROJECT LEG · MARKET NOT ACTIVE"}</small>
             </div>
 
             <div className="allocation allocation-stock">
@@ -778,8 +1020,13 @@ function HomePage() {
                   setActionMessage("");
                   setSubmittedHash("");
                   setReceiptWallet("");
+                  setReceiptGateway("");
+                  setReceiptConfirmedBlock(null);
                   setReceiptMemberNumber(null);
+                  setReceiptMemberStatus("idle");
+                  setReceiptMemberMessage("");
                   submittedHashRef.current = "";
+                  receiptVerificationRef.current = null;
                   setIsBuySheetOpen(true);
                 }}
                 disabled={isBusy}
@@ -788,6 +1035,7 @@ function HomePage() {
               </button>
             ) : (
               <a
+                ref={buyTriggerRef}
                 className="buy-button"
                 href="/flow"
                 onClick={(event) => {
@@ -814,6 +1062,141 @@ function HomePage() {
         </div>
       </main>
 
+      {isHolderStockDialogOpen && (
+        <div className="buy-dialog-backdrop holder-stock-dialog-backdrop" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) closeHolderStockDialog();
+        }}>
+          <section
+            id="holder-stock-dialog"
+            ref={holderStockDialogRef}
+            className="buy-dialog holder-stock-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="holder-stock-dialog-title"
+            aria-describedby="holder-stock-dialog-description"
+            tabIndex={-1}
+          >
+            <div className="buy-dialog-head holder-stock-dialog-head">
+              <div>
+                <span id="holder-stock-dialog-title">OFFICIAL 99/1 STOCK-TOKEN CALCULATION</span>
+                <small>CURRENT CANONICAL GATEWAY. CONFIRMED SELF-BUYS ONLY.</small>
+              </div>
+              <button type="button" aria-label="Close Stock Token calculation dialog" onClick={closeHolderStockDialog}>
+                <X size={24} weight="bold" />
+              </button>
+            </div>
+            <p id="holder-stock-dialog-description" className="visually-hidden">
+              Verified Stock Token purchase-cost calculation for self-directed trades through the
+              current canonical 99/1 Gateway since its activation block.
+            </p>
+
+            <div className="holder-stock-ca-binding">
+              <span>CANONICAL OFFICIAL CA</span>
+              <code>{officialTokenAddress || "PENDING"}</code>
+            </div>
+
+            {!holderStockBindingReady ? (
+              <div className="holder-stock-proof-state holder-stock-proof-pending">
+                <strong>{officialTokenAddress ? "MARKET BINDING PENDING" : "OFFICIAL CA PENDING"}</strong>
+                <p>
+                  The calculation starts only after the official CA, canonical Gateway, activation
+                  block, and QQQ settlement route are verifiably bound. No placeholder dollar value
+                  is shown.
+                </p>
+              </div>
+            ) : holderStockProof.status === "activation_pending" ? (
+              <div className="holder-stock-proof-state holder-stock-proof-pending" role="status" aria-live="polite">
+                <strong>ACTIVATION CONFIRMING</strong>
+                <p>
+                  The official CA and Gateway are bound, but the activation block has not reached
+                  the required confirmation depth. No zero or estimated total is displayed.
+                </p>
+              </div>
+            ) : ["pending", "idle", "loading"].includes(holderStockProof.status) ? (
+              <div className="holder-stock-proof-state holder-stock-proof-loading" role="status" aria-live="polite">
+                <strong>READING CONFIRMED TRADES…</strong>
+                <p>
+                  Matching self-directed SplitBuy events to the canonical USDG → QQQ pool.
+                </p>
+              </div>
+            ) : holderStockProof.status === "error" ? (
+              <div className="holder-stock-proof-state holder-stock-proof-error" role="alert">
+                <strong>CALCULATION UNAVAILABLE</strong>
+                <p>
+                  The canonical logs could not be completely verified. No partial total or estimate
+                  is displayed.
+                </p>
+                <button type="button" onClick={holderStockProof.refresh}>
+                  <ArrowClockwise size={18} weight="bold" /> RETRY VERIFICATION
+                </button>
+              </div>
+            ) : (
+              <>
+                <div
+                  className={`holder-stock-proof-result${holderStockProof.status === "stale" ? " is-stale" : ""}`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  <span>CURRENT CANONICAL GATEWAY · CONFIRMED USDG CASH LEG</span>
+                  <strong>≈${formatGroupedDecimal(holderStockProof.approximateUsdValue)}</strong>
+                  <small>
+                    {holderStockProof.status === "empty"
+                      ? "VERIFIED ZERO · NO CONFIRMED SELF-DIRECTED SPLITBUY EVENTS"
+                      : `SINCE ACTIVATION BLOCK ${holderStockProof.activatedBlock} · NOMINAL $1 PER USDG`}
+                  </small>
+                </div>
+
+                <div className="holder-stock-proof-grid">
+                  <div><span>SELF-BUY EVENTS</span><b>{holderStockProof.selfBuyCount.toLocaleString("en-US")}</b></div>
+                  <div><span>UNIQUE BUYERS</span><b>{holderStockProof.uniqueBuyerCount.toLocaleString("en-US")}</b></div>
+                  <div><span>USDG SPENT</span><b>{formatGroupedDecimal(holderStockProof.usdgSpent)} USDG</b></div>
+                  <div><span>QQQ RECEIVED</span><b>{formatGroupedDecimal(holderStockProof.qqqAmount)} QQQ</b></div>
+                </div>
+
+                <div className="holder-stock-proof-formula">
+                  <span>VERIFIED FORMULA</span>
+                  <code>Σ USDG→QQQ amount0 · payer = recipient · −amount1 = SplitBuy.stockAmountOut</code>
+                  <p>
+                    Direct CA buys, sells, transfers, airdrops, and unmatched swaps are excluded
+                    because they did not prove a Stock Token leg. A future Gateway replacement
+                    starts a new activation epoch; this is not an all-version historical total.
+                  </p>
+                </div>
+
+                <dl className="holder-stock-proof-meta">
+                  <div><dt>BLOCK RANGE</dt><dd>{holderStockProof.activatedBlock} → {holderStockProof.asOfBlock}</dd></div>
+                  <div><dt>CHECKED</dt><dd>{formatProofTimestamp(holderStockProof.updatedAt)}</dd></div>
+                  <div><dt>STATE</dt><dd>{holderStockProof.status === "stale" ? "STALE · LAST VERIFIED TOTAL" : "CONFIRMED"}</dd></div>
+                </dl>
+
+                <div className="holder-stock-proof-actions">
+                  <button type="button" onClick={holderStockProof.refresh}>
+                    <ArrowClockwise size={18} weight="bold" /> REFRESH
+                  </button>
+                  <a href={`${CHAIN.blockExplorerUrls[0]}/token/${officialTokenAddress}`} target="_blank" rel="noreferrer">
+                    OFFICIAL CA <ArrowRight size={17} weight="bold" />
+                  </a>
+                  <a href={`${CHAIN.blockExplorerUrls[0]}/address/${holderStockProof.gatewayAddress}?tab=logs`} target="_blank" rel="noreferrer">
+                    GATEWAY LOGS <ArrowRight size={17} weight="bold" />
+                  </a>
+                  <a href={`${CHAIN.blockExplorerUrls[0]}/address/${holderStockProof.settlementPoolAddress}?tab=logs`} target="_blank" rel="noreferrer">
+                    USDG/QQQ POOL <ArrowRight size={17} weight="bold" />
+                  </a>
+                </div>
+
+                {holderStockProof.status === "stale" ? (
+                  <p className="holder-stock-proof-warning" role="status">
+                    {holderStockProof.error
+                      ? "The last complete total is retained because the latest refresh failed."
+                      : "This proof has expired. Refresh it before treating the total as current."}
+                  </p>
+                ) : null}
+              </>
+            )}
+          </section>
+        </div>
+      )}
+
       {isBuySheetOpen && (
         <div className="buy-dialog-backdrop" onMouseDown={(event) => {
           if (event.target === event.currentTarget) closeBuyDialog();
@@ -829,7 +1212,12 @@ function HomePage() {
           >
             <div className="buy-dialog-head">
               <div><span id="buy-dialog-title">MAKE THE BAD DECISION</span><small>FEES FIRST. THEN 99/1.</small></div>
-              <button type="button" aria-label="Close buy dialog" onClick={closeBuyDialog}>
+              <button
+                type="button"
+                aria-label={actionState === "submitting" ? "Waiting for wallet submission" : "Close buy dialog"}
+                onClick={closeBuyDialog}
+                disabled={actionState === "submitting"}
+              >
                 <X size={24} weight="bold" />
               </button>
             </div>
@@ -839,10 +1227,16 @@ function HomePage() {
                 MARKET <b>{runtime.status === "checking" ? "CHECKING" : runtime.ready ? "READY" : "BLOCKED"}</b>
               </span>
               <span>
-                QUOTE <b>{runtime.checks?.quote ? "READY" : runtime.status === "checking" ? "CHECKING" : "BLOCKED"}</b>
+                QUOTE SERVICE <b>{runtime.ready && runtime.checks?.quote ? "ROUTE READY" : runtime.checks?.quote ? "CHECK PASSED · MARKET BLOCKED" : runtime.status === "checking" ? "CHECKING" : "BLOCKED"}</b>
               </span>
               <span>
-                ELIGIBILITY <b>{eligibility.status === "eligible" ? "WALLET PASSED" : runtime.checks?.eligibility ? "SERVICE READY" : runtime.status === "checking" ? "CHECKING" : "BLOCKED"}</b>
+                ELIGIBILITY <b>{eligibility.status === "eligible" && runtime.ready ? "WALLET PASSED" : runtime.checks?.eligibility ? "CHECK PASSED · MARKET BLOCKED" : runtime.status === "checking" ? "CHECKING" : "BLOCKED"}</b>
+              </span>
+              <span>
+                OPERATIONS <b>{runtime.ready && runtime.checks?.operations ? "READY" : runtime.checks?.operations ? "CHECK PASSED · MARKET BLOCKED" : runtime.status === "checking" ? "CHECKING" : "BLOCKED"}</b>
+              </span>
+              <span>
+                AUDIT <b>{runtime.checks?.audit ? "RECORDED" : runtime.status === "checking" ? "CHECKING" : "BLOCKED"}</b>
               </span>
               <small>
                 {walletAccount
@@ -868,7 +1262,9 @@ function HomePage() {
               <small className={`amount-validation${hasAmount && !amountValidation.valid ? " action-error" : ""}`}>
                 {hasAmount
                   ? amountValidation.valid
-                    ? "AMOUNT IS WITHIN THE VERIFIED RUNTIME LIMITS."
+                    ? runtimeReady && runtime.limits
+                      ? "AMOUNT IS WITHIN THE VERIFIED RUNTIME LIMITS."
+                      : "AMOUNT FORMAT IS VALID. MARKET LIMITS ARE NOT CURRENTLY VERIFIED."
                     : amountValidation.message
                   : "ENTER AN AMOUNT BEFORE THE WALLET CHECK STARTS."}
               </small>
@@ -909,25 +1305,58 @@ function HomePage() {
             )}
 
             {submittedHash ? (
-              <div className="dialog-receipt-success">
+              <div className={`dialog-receipt-success${receiptFailed ? " dialog-receipt-failed" : ""}`}>
                 <div>
-                  <span>{actionState === "success" ? "CONFIRMED 99/1 RECEIPT" : "PENDING 99/1 RECEIPT"}</span>
+                  <span>
+                    {actionState === "success"
+                      ? "CONFIRMED 99/1 RECEIPT"
+                      : receiptFailed
+                        ? "FAILED 99/1 TRANSACTION"
+                        : "PENDING 99/1 RECEIPT"}
+                  </span>
                   <strong>{shortAddress(submittedHash)}</strong>
                   <small>
                     {actionState === "success"
-                      ? "BOTH LEGS CONFIRMED. COUNTERS ARE REFRESHING FROM CANONICAL DATA."
-                      : "DO NOT RESUBMIT AUTOMATICALLY. VERIFY THIS HASH IN THE EXPLORER."}
+                      ? "BOTH LEGS REACHED THE REQUIRED CONFIRMATION DEPTH."
+                      : receiptFailed
+                        ? "THIS HASH DID NOT PRODUCE A CONFIRMED OFFICIAL RECEIPT. REVIEW IT IN THE EXPLORER."
+                        : "DO NOT RESUBMIT AUTOMATICALLY. VERIFY THIS HASH IN THE EXPLORER."}
                   </small>
                   {actionState === "success" ? (
-                    <b className="receipt-member-number">
-                      {receiptMemberNumber
-                        ? `OFFICIAL MEMBER #${String(receiptMemberNumber).padStart(4, "0")}`
-                        : "MEMBER NUMBER INDEXING AFTER REQUIRED CONFIRMATIONS"}
-                    </b>
+                    <>
+                      <dl className="receipt-proof-bindings">
+                        <div><dt>CONFIRMED BLOCK</dt><dd>{receiptConfirmedBlock}</dd></div>
+                        <div><dt>RECIPIENT</dt><dd>{shortAddress(receiptWallet)}</dd></div>
+                        <div><dt>CANONICAL GATEWAY</dt><dd>{shortAddress(receiptGateway)}</dd></div>
+                      </dl>
+                      <b className={`receipt-member-number receipt-member-${receiptMemberStatus}`}>
+                        {receiptMemberStatus === "ready" && receiptMemberNumber
+                          ? `OFFICIAL MEMBER #${String(receiptMemberNumber).padStart(4, "0")}`
+                          : receiptMemberStatus === "unavailable"
+                            ? "MEMBER INDEX UNAVAILABLE · NO NUMBER PRINTED"
+                            : "MEMBER NUMBER INDEXING AFTER REQUIRED CONFIRMATIONS"}
+                      </b>
+                      <small className="receipt-member-message">{receiptMemberMessage}</small>
+                    </>
                   ) : null}
                 </div>
-                <div>
-                  <button type="button" onClick={shareReceipt}><ShareNetwork size={19} weight="bold" /> SHARE RECEIPT</button>
+                <div className={receiptFailed ? "dialog-receipt-actions-single" : ""}>
+                  {!receiptFailed ? (
+                    <button
+                      type="button"
+                      onClick={actionState === "pending" ? recheckReceipt : shareReceipt}
+                      disabled={!['success', 'pending'].includes(actionState)}
+                    >
+                      {actionState === "pending"
+                        ? <ArrowClockwise size={19} weight="bold" />
+                        : <ShareNetwork size={19} weight="bold" />}
+                      {actionState === "success"
+                        ? "SHARE CONFIRMED RECEIPT"
+                        : actionState === "pending"
+                          ? "CHECK RECEIPT AGAIN"
+                          : "SHARE AFTER CONFIRMATION"}
+                    </button>
+                  ) : null}
                   <a href={`${CHAIN.blockExplorerUrls[0]}/tx/${submittedHash}`} target="_blank" rel="noreferrer">VIEW ONCHAIN <ArrowRight size={18} weight="bold" /></a>
                 </div>
               </div>
@@ -955,7 +1384,11 @@ function HomePage() {
         <nav className="footer-links" aria-label="Project information">
           <a className="footer-proof" href="/flow">HOW IT WORKS</a>
           <a className="footer-proof" href="/code">VERIFY THE CODE</a>
-          <a className="footer-proof foundation-proof-link" href="/deploy">FOUNDATION VERIFIED · MARKET NOT ACTIVE</a>
+          <a className="footer-proof foundation-proof-link" href="/deploy">
+            {MARKET.releaseManifestActive
+              ? "V2 MARKET RECORDED · LIVE GATES APPLY"
+              : "V2 PREAUTHORIZED · MARKET NOT ACTIVE"}
+          </a>
         </nav>
       </footer>
     </div>
@@ -965,8 +1398,13 @@ function HomePage() {
 export function App() {
   const path = window.location.pathname.replace(/\/+$/, "") || "/";
   if (path === "/deploy") {
-    return <Suspense fallback={null}><DeployPage /></Suspense>;
+    return <Suspense fallback={<RouteFallback />}><DeployPage /></Suspense>;
   }
-  if (path === "/flow") return <FlowPage />;
-  return path === "/code" || path === "/proof" ? <CodePage /> : <HomePage />;
+  if (path === "/flow") {
+    return <Suspense fallback={<RouteFallback />}><FlowPage /></Suspense>;
+  }
+  if (path === "/code" || path === "/proof") {
+    return <Suspense fallback={<RouteFallback />}><CodePage /></Suspense>;
+  }
+  return <HomePage />;
 }
