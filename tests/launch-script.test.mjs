@@ -589,6 +589,27 @@ test("release commit binding rejects a dirty worktree", async () => {
   assert.equal(candidate.candidateUrl, "https://candidate.vercel.app");
   assert.equal(deployments, 1);
 
+  const noisyCandidate = await deployProductionCandidateAtCommit(commit, {
+    codeCommitLoader: async () => commit,
+    runCaptureImpl: async () => ({
+      code: 0,
+      stdout: "",
+      stderr: "Retrieving project…\nProduction: https://candidate-noisy.vercel.app [35s]\n",
+    }),
+  });
+  assert.equal(noisyCandidate.candidateUrl, "https://candidate-noisy.vercel.app");
+  await assert.rejects(
+    deployProductionCandidateAtCommit(commit, {
+      codeCommitLoader: async () => commit,
+      runCaptureImpl: async () => ({
+        code: 0,
+        stdout: "https://candidate-a.vercel.app\n",
+        stderr: "https://candidate-b.vercel.app\n",
+      }),
+    }),
+    /multiple deployment URLs/,
+  );
+
   let promotions = 0;
   await assert.rejects(
     promoteProductionCandidateAtCommit(candidate.candidateUrl, commit, {

@@ -736,23 +736,34 @@ export function vercelCandidateDeployCommand() {
 }
 
 function requireCandidateDeploymentUrl(value) {
-  let candidate;
-  try {
-    candidate = new URL(String(value || "").trim());
-  } catch {
+  const raw = String(value || "").replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, " ");
+  const matches = raw.match(/https:\/\/[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\.vercel\.app(?:\/[^\s]*)?/g) || [];
+  const origins = new Set();
+  for (const match of matches) {
+    let candidate;
+    try {
+      candidate = new URL(match);
+    } catch {
+      continue;
+    }
+    if (
+      candidate.protocol === "https:"
+      && candidate.hostname.endsWith(".vercel.app")
+      && !candidate.username
+      && !candidate.password
+      && !candidate.search
+      && !candidate.hash
+    ) {
+      origins.add(candidate.origin);
+    }
+  }
+  if (origins.size === 0) {
     throw new Error("CANDIDATE_DEPLOY_INVALID · Vercel did not return a deployment URL.");
   }
-  if (
-    candidate.protocol !== "https:"
-    || !candidate.hostname.endsWith(".vercel.app")
-    || candidate.username
-    || candidate.password
-    || candidate.search
-    || candidate.hash
-  ) {
-    throw new Error("CANDIDATE_DEPLOY_INVALID · Vercel returned an unexpected deployment URL.");
+  if (origins.size !== 1) {
+    throw new Error("CANDIDATE_DEPLOY_INVALID · Vercel returned multiple deployment URLs.");
   }
-  return candidate.origin;
+  return [...origins][0];
 }
 
 export function vercelPromoteCommand(candidateUrl) {
@@ -775,7 +786,7 @@ export async function deployProductionCandidateAtCommit(expectedCodeCommit, {
   }
   return Object.freeze({
     codeCommit,
-    candidateUrl: requireCandidateDeploymentUrl(result.stdout),
+    candidateUrl: requireCandidateDeploymentUrl(`${result.stdout}\n${result.stderr}`),
   });
 }
 
