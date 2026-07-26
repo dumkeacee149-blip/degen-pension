@@ -23,7 +23,9 @@ import { checkOperationalReadiness } from "./operations.js";
 import {
   PRODUCTION_RELEASE_MANIFEST,
   isValidProductionReleaseManifest,
+  publicIndependentAuditState,
   publicReleaseManifestState,
+  releaseManifestAuditConfigMatches,
   releaseManifestConfigMatches,
   releaseManifestSnapshotMatches,
 } from "./release-manifest.js";
@@ -214,7 +216,7 @@ function exactRoute(route, expectedTokens, expectedFees) {
     && route.fees.every((fee, index) => fee === expectedFees[index]);
 }
 
-function blockedOperationalReadiness(config, checkedAt) {
+function blockedOperationalReadiness(config, checkedAt, releaseManifest = PRODUCTION_RELEASE_MANIFEST) {
   return {
     checks: {
       eligibilityProvider: false,
@@ -236,6 +238,9 @@ function blockedOperationalReadiness(config, checkedAt) {
       distributedRateLimitHealthy: false,
       monitoringHealthy: false,
       independentAuditVerified: false,
+      independentAudit: publicIndependentAuditState(releaseManifest, {
+        manifestBound: releaseManifestAuditConfigMatches(config, releaseManifest),
+      }),
       stockAssetRegistry: {
         verified: false,
         tokenSymbol: null,
@@ -289,12 +294,12 @@ export async function loadRuntime(config, {
   checks.releaseManifest = !production;
   let operationalReadiness;
   if (production && validReleaseManifest && releaseManifest.tradingActive !== true) {
-    operationalReadiness = blockedOperationalReadiness(config, checkedAt);
+    operationalReadiness = blockedOperationalReadiness(config, checkedAt, releaseManifest);
   } else {
     try {
-      operationalReadiness = await operationsChecker(config);
+      operationalReadiness = await operationsChecker(config, { releaseManifest });
     } catch {
-      operationalReadiness = blockedOperationalReadiness(config, checkedAt);
+      operationalReadiness = blockedOperationalReadiness(config, checkedAt, releaseManifest);
     }
   }
   Object.assign(checks, operationalReadiness.checks);

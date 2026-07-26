@@ -15,6 +15,11 @@ import {
   readLimitedBytes,
   readLimitedText,
 } from "./response.js";
+import {
+  PRODUCTION_RELEASE_MANIFEST,
+  publicIndependentAuditState,
+  releaseManifestAuditConfigMatches,
+} from "./release-manifest.js";
 
 const auditVerificationCache = new Map();
 const readinessCache = new Map();
@@ -51,23 +56,44 @@ export function isMonitoringConfigured(config) {
   );
 }
 
-export function isIndependentAuditConfigured(config) {
-  const completedAt = Date.parse(config.independentAuditCompletedAt || "");
-  return Boolean(config.independentAuditReportUrl)
-    && /^[a-f0-9]{64}$/.test(config.independentAuditSha256 || "")
-    && config.independentAuditFirm.length >= 2
+function independentAuditEvidence(config, releaseManifest) {
+  if (config.vercelEnvironment === "production") {
+    return releaseManifestAuditConfigMatches(config, releaseManifest)
+      ? releaseManifest.independentAudit
+      : null;
+  }
+  return {
+    reportUrl: config.independentAuditReportUrl,
+    sha256: config.independentAuditSha256,
+    firm: config.independentAuditFirm,
+    completedAt: config.independentAuditCompletedAt,
+    scope: { sourceCommit: config.independentAuditSourceCommit },
+  };
+}
+
+export function isIndependentAuditConfigured(
+  config,
+  releaseManifest = PRODUCTION_RELEASE_MANIFEST,
+) {
+  const evidence = independentAuditEvidence(config, releaseManifest);
+  const completedAt = Date.parse(evidence?.completedAt || "");
+  return Boolean(evidence?.reportUrl)
+    && /^[a-f0-9]{64}$/.test(evidence?.sha256 || "")
+    && evidence.firm.length >= 2
+    && /^[a-f0-9]{40}$/.test(evidence.scope?.sourceCommit || "")
     && Number.isFinite(completedAt)
     && completedAt <= Date.now();
 }
 
-async function verifyIndependentAudit(config, { fetchImpl = fetch } = {}) {
-  if (!isIndependentAuditConfigured(config)) return false;
-  const cacheKey = `${config.independentAuditReportUrl}:${config.independentAuditSha256}`;
+async function verifyIndependentAudit(config, releaseManifest, { fetchImpl = fetch } = {}) {
+  if (!isIndependentAuditConfigured(config, releaseManifest)) return false;
+  const evidence = independentAuditEvidence(config, releaseManifest);
+  const cacheKey = `${evidence.reportUrl}:${evidence.sha256}:${evidence.scope.sourceCommit}`;
   const cached = auditVerificationCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.verified;
   let verified = false;
   try {
-    const response = await fetchImpl(config.independentAuditReportUrl, {
+    const response = await fetchImpl(evidence.reportUrl, {
       method: "GET",
       headers: { accept: "application/pdf" },
       redirect: "error",
@@ -85,7 +111,7 @@ async function verifyIndependentAudit(config, { fetchImpl = fetch } = {}) {
     if (bytes.subarray(0, 5).toString("ascii") !== "%PDF-") {
       throw new Error("audit report invalid");
     }
-    verified = createHash("sha256").update(bytes).digest("hex") === config.independentAuditSha256;
+    verified = createHash("sha256").update(bytes).digest("hex") === evidence.sha256;
   } catch {
     verified = false;
   }
@@ -102,7 +128,12 @@ function developmentEligibilityConfigured(config) {
   return provider && hasStrongSecret(config.eligibilitySigningSecret);
 }
 
-export async function checkOperationalReadiness(config, { fetchImpl = fetch } = {}) {
+export async function checkOperationalReadiness(config, {
+  fetchImpl = fetch,
+  releaseManifest = PRODUCTION_RELEASE_MANIFEST,
+} = {}) {
+  const auditManifestBound = config.vercelEnvironment === "production"
+    && releaseManifestAuditConfigMatches(config, releaseManifest);
   const cacheKey = [
     config.vercelEnvironment,
     config.eligibilityProviderMode,
@@ -116,6 +147,12 @@ export async function checkOperationalReadiness(config, { fetchImpl = fetch } = 
     isMonitoringConfigured(config),
     config.independentAuditReportUrl,
     config.independentAuditSha256,
+    config.independentAuditFirm,
+    config.independentAuditCompletedAt,
+    config.independentAuditSourceCommit,
+    releaseManifest?.manifestId,
+    releaseManifest?.independentAudit?.sha256,
+    releaseManifest?.independentAudit?.scope?.sourceCommit,
     config.stockAssetRegistryCheckEnabled,
   ].join(":");
   const cached = readinessCache.get(cacheKey);
@@ -130,7 +167,7 @@ export async function checkOperationalReadiness(config, { fetchImpl = fetch } = 
     stockAssetRegistry,
   ] = await Promise.all([
     statsIndexerConfigured ? checkStatsIndexerHealth(config, { fetchImpl }) : false,
-    verifyIndependentAudit(config, { fetchImpl }),
+    verifyIndependentAudit(config, releaseManifest, { fetchImpl }),
     checkSignedOperationalHealth(config, "rate-limit", { fetchImpl }),
     checkSignedOperationalHealth(config, "monitoring", { fetchImpl }),
     checkStockAssetRegistry(config, { fetchImpl }),
@@ -159,6 +196,10 @@ export async function checkOperationalReadiness(config, { fetchImpl = fetch } = 
       distributedRateLimitHealthy: checks.distributedRateLimit,
       monitoringHealthy: checks.monitoring,
       independentAuditVerified: checks.independentAudit,
+      independentAudit: publicIndependentAuditState(releaseManifest, {
+        manifestBound: auditManifestBound,
+        verified: checks.independentAudit,
+      }),
       stockAssetRegistry,
     },
   };

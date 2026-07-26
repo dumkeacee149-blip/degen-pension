@@ -440,7 +440,9 @@ export function CodePage() {
           <div><CheckCircle size={25} weight="fill" /><p><b>DIRECT · TESTED</b>The Gateway implementation measures both output-token balance changes at the recipient.</p></div>
           <div><CheckCircle size={25} weight="fill" /><p><b>ATOMIC · TESTED</b>The Gateway implementation unwinds the transaction if the fee transfer or either adapter call reverts.</p></div>
           <div><Wallet size={25} weight="fill" /><p><b>DEFERRED WALLET</b>The homepage asks for a wallet only after the buyer confirms an amount.</p></div>
-          <div className="code-page-warning"><WarningCircle size={25} weight="fill" /><p><b>UNAUDITED · EXTERNAL PROVIDER REQUIRED</b>Tests and a real-chain fork are not a substitute for an independent security review. Production stock-token eligibility requires a configured external sanctions/KYC provider; the current public service is not configured and self-attestation alone is insufficient.</p></div>
+          <div className="code-page-warning"><WarningCircle size={25} weight="fill" /><p><b>{runtime.ready ? "LIVE RELEASE GATES VERIFIED" : "UNAUDITED · EXTERNAL PROVIDER REQUIRED"}</b>{runtime.ready
+            ? "The live runtime reports that the manifest-bound independent audit and external eligibility gates passed. The homepage still rechecks the complete route before requesting a wallet."
+            : "Tests and a real-chain fork are not a substitute for an independent security review. Production stock-token eligibility requires a configured external sanctions/KYC provider; the live runtime does not currently verify that complete control stack, and self-attestation alone is insufficient."}</p></div>
         </section>
       </main>
 

@@ -72,9 +72,11 @@ Request:
 ```
 
 The country is taken from Vercel's trusted `x-vercel-ip-country` header, never
-from the body. Unknown countries, US persons, the default blocked list
-(`US,CA,GB,CH`), missing terms, provider errors and malformed responses are
-denied. Production requires `ELIGIBILITY_PROVIDER_MODE=external`; the built-in
+from the body. Unknown countries, US persons, countries in the authoritative
+`ELIGIBILITY_BLOCKED_COUNTRIES` configuration (the shipped default is
+`US,CA,GB,CH,CU,BY,IR,KP,RU,SY,UA,SS,SD,MM,VE`), missing terms, provider errors
+and malformed responses are denied. Production requires
+`ELIGIBILITY_PROVIDER_MODE=external`; the built-in
 geo-attestation mode is development-only and is not identity-level KYC.
 Provider requests use a timestamped HMAC. A response must be at most 32 KiB,
 have a fresh `x-degen-provider-timestamp`, and carry
@@ -167,8 +169,9 @@ block**. It accepts no CA or Gateway from the request. The service:
 2. counts only confirmation-safe `SplitBuy` events where `payer == recipient`
    and `projectAmountIn`, `stockAmountIn`, `projectAmountOut`, and
    `stockAmountOut` are all positive;
-3. requires each event to match exactly one earlier, same-transaction Swap emitted by
-   the canonical router in the immutable USDG/QQQ pool;
+3. requires each event to match exactly one earlier, same-transaction `Swap` emitted
+   by the immutable canonical USDG/QQQ pool, with the event's `sender` equal to the
+   canonical router and `recipient` equal to the buyer;
 4. requires the pool's QQQ output to equal `SplitBuy.stockAmountOut`; and
 5. sums the actual USDG input, returning its nominal dollar equivalent together
    with raw amounts, token decimals, source, checked time and confirmation-safe
@@ -304,9 +307,14 @@ far shorter, so an outage returns a controlled `503` instead of an implicit
 6. Store `ELIGIBILITY_SIGNER_PRIVATE_KEY` and provider credentials as encrypted
    server-only Vercel secrets. `policyAdmin` can atomically rotate the proof
    signer and policy hash; never reuse a deployer or treasury key.
-7. Obtain an independent contract audit. Publish the final PDF and pin its exact
-   SHA-256, auditor, and completion date. Runtime downloads the bounded PDF and
-   verifies the digest; metadata alone cannot make this gate green.
+7. Obtain an independent contract audit. Publish the final PDF and commit its
+   URL, SHA-256, auditor, completion date, audited source commit, and exact
+   Registry/Implementation/code-hash scope under `independentAudit` in the sole
+   production manifest. Production environment values are non-authoritative
+   mirrors and must match that record exactly. Runtime downloads the bounded PDF
+   from the manifest URL and verifies its digest; metadata alone cannot make the
+   gate green. The current inactive manifest explicitly records `not-ready` and
+   null evidence, so this gate remains closed.
 8. Run `npm run verify`, deploy Preview, call all six endpoints, execute a
    representative `eth_call`, then promote that exact immutable deployment.
 9. Keep `LOG_CONFIRMATIONS >= 1`; Production treats zero or invalid values as

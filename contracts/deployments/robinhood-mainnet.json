@@ -6,6 +6,14 @@
   "protocolVersion": 2,
   "status": "production-v2-preauthorized",
   "tradingActive": false,
+  "independentAudit": {
+    "status": "not-ready",
+    "reportUrl": null,
+    "sha256": null,
+    "firm": null,
+    "completedAt": null,
+    "scope": null
+  },
   "deployedAt": "2026-07-25T12:33:19.000Z",
   "blockNumber": 19012656,
   "transactionHash": "0x3e1b4c309f2c56b1b7c51b80f08d2ffb7c813f737d1c4daf41ccb66da5ec2ef4",

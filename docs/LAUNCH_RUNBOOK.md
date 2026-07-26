@@ -60,7 +60,7 @@ node scripts/launch-production.mjs <OFFICIAL_CA> \
 
 - 冻结唯一 V2 部署清单中的 `ProductionMarketActivator` Registry、锁定 Gateway Implementation、Eligibility Checker、QQQ Adapter、Pons Adapter Factory、输入资产和 canonical QQQ。
 - 从 `contracts/deployments/robinhood-mainnet.json` 读取全部控制栈地址；核对 chain ID、protocol version、immutable roles、运行时代码哈希和 source verification。不得从 `.launch-local` 或 V1 foundation 记录选择当前 Registry。
-- 确认独立审计覆盖这份确切的 V2 源码/部署范围，公开 PDF 可下载且 SHA-256 与 Production 环境固定值一致；Critical/High 未关闭或仍标为 unaudited 时直接 `NO-GO`。
+- 确认独立审计覆盖这份确切的 V2 源码 commit、Registry、Gateway Implementation 与 runtime code hash；把公开 PDF URL、SHA-256、审计方、完成时间和完整 scope 提交进唯一 Production manifest。Production 环境只能镜像且必须精确匹配该记录，不能自行提供审计证据；Critical/High 未关闭、manifest 仍为 `not-ready` 或 PDF 摘要不符时直接 `NO-GO`。
 - 冻结可复现 release commit，要求工作树无未提交生产改动；记录 commit、构建产物摘要和唯一部署清单 SHA-256。
 - 确认官方前端域名、状态页、支持渠道和社交账号权限。
 - 准备项目发行平台 Adapter；禁止为了赶发布临时开放任意 Call。

@@ -17,6 +17,7 @@ import {
   assertRegistrySnapshotMatchesManifest,
   assertRuntimeReady,
   CONTROL_WALLET,
+  AUDIT_VERCEL_RUNTIME_KEYS,
   createOperatorControlChallenge,
   deployProductionCandidateAtCommit,
   deploymentManifestDigest,
@@ -75,7 +76,25 @@ async function deploymentManifest(overrides = {}) {
     new URL("../contracts/deployments/robinhood-mainnet.json", import.meta.url),
     "utf8",
   ));
-  return validateDeploymentManifest({ ...source, ...overrides });
+  const merged = { ...source, ...overrides };
+  if (merged.tradingActive === true && overrides.independentAudit === undefined) {
+    merged.independentAudit = {
+      status: "verified",
+      reportUrl: "https://auditor.example/report.pdf",
+      sha256: "ab".repeat(32),
+      firm: "Independent Security Lab",
+      completedAt: "2026-07-01T00:00:00.000Z",
+      scope: {
+        manifestId: merged.manifestId,
+        protocolVersion: merged.protocolVersion,
+        registry: merged.registry,
+        gatewayImplementation: merged.gatewayImplementation,
+        gatewayImplementationRuntimeCodeHash: merged.gatewayImplementationRuntimeCodeHash,
+        sourceCommit: "cd".repeat(20),
+      },
+    };
+  }
+  return validateDeploymentManifest(merged);
 }
 
 function registrySnapshot(manifest, overrides = {}) {
@@ -104,7 +123,7 @@ function registrySnapshot(manifest, overrides = {}) {
   };
 }
 
-function readyOperationalRuntime(checkedAt = new Date().toISOString()) {
+function readyOperationalRuntime(manifest, checkedAt = new Date().toISOString()) {
   return {
     checks: { ...READY_RUNTIME_CHECKS },
     operations: {
@@ -119,6 +138,16 @@ function readyOperationalRuntime(checkedAt = new Date().toISOString()) {
       distributedRateLimitHealthy: true,
       monitoringHealthy: true,
       independentAuditVerified: true,
+      independentAudit: {
+        status: "VERIFIED",
+        manifestBound: true,
+        verified: true,
+        reportUrl: manifest.independentAudit.reportUrl,
+        sha256: manifest.independentAudit.sha256,
+        firm: manifest.independentAudit.firm,
+        completedAt: manifest.independentAudit.completedAt,
+        scope: { ...manifest.independentAudit.scope },
+      },
       stockAssetRegistry: {
         verified: true,
         tokenSymbol: "QQQ",
@@ -239,7 +268,10 @@ test("Vercel synchronization exposes only runtime verification bindings", () => 
   const commands = vercelRuntimeSyncCommands(snapshot);
   const removes = commands.filter(({ action }) => action === "remove");
   const adds = commands.filter(({ action }) => action === "add");
-  assert.deepEqual(removes.map(({ name }) => name), [...LEGACY_VERCEL_RUNTIME_KEYS]);
+  assert.deepEqual(
+    removes.map(({ name }) => name),
+    [...LEGACY_VERCEL_RUNTIME_KEYS, ...AUDIT_VERCEL_RUNTIME_KEYS],
+  );
   assert.ok(removes.every(({ args, name }) => (
     JSON.stringify(args) === JSON.stringify(["vercel", "env", "rm", name, "production", "--yes"])
   )));
@@ -255,6 +287,24 @@ test("Vercel synchronization exposes only runtime verification bindings", () => 
     "OFFICIAL_TOKEN_ADDRESS",
     "GATEWAY_ACTIVATED_BLOCK",
   ].includes(name) || removes.some((command) => command.name === name)));
+});
+
+test("Vercel audit mirrors are derived from verified manifest evidence", async () => {
+  const manifest = await deploymentManifest({
+    tradingActive: true,
+    currentOfficialToken: "0x7777777777777777777777777777777777777777",
+    currentMarket: "0x8888888888888888888888888888888888888888",
+    currentActivatedBlock: 123,
+  });
+  const values = vercelRuntimeValues(registrySnapshot(manifest), manifest);
+  assert.equal(values.INDEPENDENT_AUDIT_REPORT_URL, manifest.independentAudit.reportUrl);
+  assert.equal(values.INDEPENDENT_AUDIT_SHA256, manifest.independentAudit.sha256);
+  assert.equal(values.INDEPENDENT_AUDIT_FIRM, manifest.independentAudit.firm);
+  assert.equal(values.INDEPENDENT_AUDIT_COMPLETED_AT, manifest.independentAudit.completedAt);
+  assert.equal(
+    values.INDEPENDENT_AUDIT_SOURCE_COMMIT,
+    manifest.independentAudit.scope.sourceCommit,
+  );
 });
 
 test("production release stages with skip-domain and promotes only after the canary gate", async () => {
@@ -350,6 +400,14 @@ test("the checked-in deployment manifest is the sole, internally consistent stac
   assert.equal(manifest.projectAuthority, CONTROL_WALLET);
   assert.notEqual(manifest.launchOperator, manifest.projectAuthority);
   assert.equal(manifest.tradingActive, false);
+  assert.deepEqual(manifest.independentAudit, {
+    status: "not-ready",
+    reportUrl: null,
+    sha256: null,
+    firm: null,
+    completedAt: null,
+    scope: null,
+  });
   assert.equal(manifest.currentActivatedBlock, 0);
   assert.match(deploymentManifestDigest(manifest), /^[a-f0-9]{64}$/);
   assert.doesNotThrow(() => assertRegistrySnapshotMatchesManifest(registrySnapshot(manifest), manifest));
@@ -359,6 +417,14 @@ test("the checked-in deployment manifest is the sole, internally consistent stac
       manifest,
     ),
     /DEPLOYMENT_MANIFEST_MISMATCH.*launchOperator/,
+  );
+  assert.notEqual(
+    deploymentManifestDigest(manifest),
+    deploymentManifestDigest({
+      ...manifest,
+      independentAudit: { ...manifest.independentAudit, status: "tampered" },
+    }),
+    "operator/release digest must bind audit evidence",
   );
 });
 
@@ -412,6 +478,45 @@ test("prepare mode refuses an active manifest before Vercel sync or deployment",
   assert.equal(syncs, 1);
   assert.equal(candidates, 1);
   assert.equal(promotions, 1);
+
+  const auditedInactiveManifest = validateDeploymentManifest({
+    ...inactiveManifest,
+    independentAudit: {
+      status: "verified",
+      reportUrl: "https://auditor.example/report.pdf",
+      sha256: "ab".repeat(32),
+      firm: "Independent Security Lab",
+      completedAt: "2026-07-01T00:00:00.000Z",
+      scope: {
+        manifestId: inactiveManifest.manifestId,
+        protocolVersion: inactiveManifest.protocolVersion,
+        registry: inactiveManifest.registry,
+        gatewayImplementation: inactiveManifest.gatewayImplementation,
+        gatewayImplementationRuntimeCodeHash:
+          inactiveManifest.gatewayImplementationRuntimeCodeHash,
+        sourceCommit: "cd".repeat(20),
+      },
+    },
+  });
+  const auditedPrepared = await prepareInactiveProductionSite({
+    manifest: auditedInactiveManifest,
+    snapshot: registrySnapshot(auditedInactiveManifest),
+    codeCommit,
+    codeCommitLoader: async () => codeCommit,
+    syncImpl: async (_snapshot, syncedManifest) => {
+      syncs += 1;
+      assert.equal(syncedManifest.independentAudit.status, "verified");
+    },
+    candidateDeployImpl: async () => {
+      candidates += 1;
+      return { codeCommit, candidateUrl: "https://candidate-audited.vercel.app" };
+    },
+    promoteImpl: async () => { promotions += 1; },
+  });
+  assert.equal(auditedPrepared.status, "PREPARED");
+  assert.equal(syncs, 2);
+  assert.equal(candidates, 2);
+  assert.equal(promotions, 2);
 });
 
 test("operator control proof is fresh, fully bound, auditable and single-use per process", async () => {
@@ -632,7 +737,7 @@ test("runtime readiness requires the complete fresh V2 contract and operational 
   });
   const snapshot = registrySnapshot(manifest);
   const checkedAt = new Date().toISOString();
-  const operational = readyOperationalRuntime(checkedAt);
+  const operational = readyOperationalRuntime(manifest, checkedAt);
   const ready = {
     schemaVersion: 1,
     ready: true,
@@ -705,6 +810,21 @@ test("runtime readiness requires the complete fresh V2 contract and operational 
       operations: { ...ready.operations, independentAuditVerified: false },
     }, { ca, snapshot, manifest }),
     /RUNTIME_NOT_READY.*independentAudit/,
+  );
+  assert.throws(
+    () => assertRuntimeReady({
+      ...ready,
+      operations: {
+        ...ready.operations,
+        independentAudit: {
+          ...ready.operations.independentAudit,
+          reportUrl: "https://attacker.example/self-report.pdf",
+          sha256: "ef".repeat(32),
+        },
+      },
+    }, { ca, snapshot, manifest }),
+    /RUNTIME_NOT_READY.*productionOperations/,
+    "a READY boolean cannot replace manifest-bound public audit evidence",
   );
   const { gatewayBindings: _gatewayBindings, ...incompleteCoreChecks } = ready.checks;
   assert.throws(
@@ -849,7 +969,7 @@ test("production gate requires READY, eligibility, quote, independent eth_call a
   const policyHash = manifest.eligibilityPolicyHash;
   const projectPath = "0x010203";
   const stockPath = "0x040506";
-  const operational = readyOperationalRuntime();
+  const operational = readyOperationalRuntime(manifest);
   const codeCommit = "56".repeat(20);
   let proofByte = 1;
   const freshOperatorProof = async () => {
@@ -1000,6 +1120,7 @@ test("production gate requires READY, eligibility, quote, independent eth_call a
   assert.equal(result.manifestId, manifest.manifestId);
   assert.equal(result.gatewayCodeHash, runtime.gatewayCodeHash);
   assert.equal(result.operations.independentAuditVerified, true);
+  assert.deepEqual(result.independentAudit, runtime.operations.independentAudit);
   assert.equal(result.codeCommit, codeCommit);
   assert.equal(result.operatorControlProof.challenge, operatorControlProof.challenge);
   assert.equal((await assertOperatorProofCurrentForPromotion(

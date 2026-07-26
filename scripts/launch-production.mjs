@@ -79,6 +79,13 @@ export const LEGACY_VERCEL_RUNTIME_KEYS = Object.freeze([
   "OFFICIAL_TOKEN_ADDRESS",
   "GATEWAY_ACTIVATED_BLOCK",
 ]);
+export const AUDIT_VERCEL_RUNTIME_KEYS = Object.freeze([
+  "INDEPENDENT_AUDIT_REPORT_URL",
+  "INDEPENDENT_AUDIT_SHA256",
+  "INDEPENDENT_AUDIT_FIRM",
+  "INDEPENDENT_AUDIT_COMPLETED_AT",
+  "INDEPENDENT_AUDIT_SOURCE_COMMIT",
+]);
 
 const issuedOperatorChallenges = new Map();
 const consumedOperatorProofs = new Set();
@@ -214,6 +221,23 @@ function nullableAddress(value, label) {
   return requireAddress(value, label);
 }
 
+function requireSha256(value, label) {
+  if (!/^[a-f0-9]{64}$/.test(String(value || ""))) {
+    throw new Error(`${label} must be a lowercase SHA-256 digest.`);
+  }
+  return String(value);
+}
+
+function requireHttpsUrl(value, label) {
+  try {
+    const parsed = new URL(String(value || ""));
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.hash) throw new Error();
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    throw new Error(`${label} must be a public HTTPS URL without credentials or a fragment.`);
+  }
+}
+
 function manifestIdentity(manifest) {
   return {
     schemaVersion: manifest.schemaVersion,
@@ -234,7 +258,70 @@ function manifestIdentity(manifest) {
     currentMarket: manifest.currentMarket,
     currentActivatedBlock: manifest.currentActivatedBlock,
     tradingActive: manifest.tradingActive,
+    independentAudit: manifest.independentAudit,
   };
+}
+
+function validateIndependentAudit(input, manifest) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("Deployment manifest must explicitly record independentAudit evidence.");
+  }
+  if (input.status === "not-ready") {
+    if (
+      input.reportUrl !== null
+      || input.sha256 !== null
+      || input.firm !== null
+      || input.completedAt !== null
+      || input.scope !== null
+    ) {
+      throw new Error("A not-ready independentAudit record must not contain evidence.");
+    }
+    if (manifest.tradingActive === true) {
+      throw new Error("Active deployment manifest requires verified independentAudit evidence and scope.");
+    }
+    return Object.freeze({ ...input });
+  }
+  const scope = input.scope;
+  if (input.status !== "verified" || !scope || typeof scope !== "object" || Array.isArray(scope)) {
+    throw new Error("Deployment manifest independentAudit must be not-ready or verified with scope.");
+  }
+  const completedAt = new Date(input.completedAt || "");
+  if (!Number.isFinite(completedAt.getTime()) || completedAt.getTime() > Date.now()) {
+    throw new Error("Independent audit completion date is invalid or in the future.");
+  }
+  const normalized = {
+    status: "verified",
+    reportUrl: requireHttpsUrl(input.reportUrl, "Independent audit report URL"),
+    sha256: requireSha256(input.sha256, "Independent audit report digest"),
+    firm: String(input.firm || "").trim(),
+    completedAt: completedAt.toISOString(),
+    scope: {
+      manifestId: scope.manifestId,
+      protocolVersion: scope.protocolVersion,
+      registry: requireAddress(scope.registry, "Independent audit scope Registry"),
+      gatewayImplementation: requireAddress(
+        scope.gatewayImplementation,
+        "Independent audit scope Gateway implementation",
+      ),
+      gatewayImplementationRuntimeCodeHash: requireHash(
+        scope.gatewayImplementationRuntimeCodeHash,
+        "Independent audit scope implementation code hash",
+      ),
+      sourceCommit: requireCommit(scope.sourceCommit, "Independent audit source commit"),
+    },
+  };
+  if (normalized.firm.length < 2) throw new Error("Independent audit firm is missing.");
+  if (
+    normalized.scope.manifestId !== manifest.manifestId
+    || normalized.scope.protocolVersion !== manifest.protocolVersion
+    || normalized.scope.registry !== manifest.registry
+    || normalized.scope.gatewayImplementation !== manifest.gatewayImplementation
+    || normalized.scope.gatewayImplementationRuntimeCodeHash
+      !== manifest.gatewayImplementationRuntimeCodeHash
+  ) {
+    throw new Error("Independent audit scope does not match the sole deployment manifest.");
+  }
+  return Object.freeze({ ...normalized, scope: Object.freeze(normalized.scope) });
 }
 
 export function validateDeploymentManifest(input) {
@@ -305,6 +392,7 @@ export function validateDeploymentManifest(input) {
   ) {
     throw new Error("Inactive deployment manifest must not contain an active market binding.");
   }
+  manifest.independentAudit = validateIndependentAudit(input.independentAudit, manifest);
   return Object.freeze(manifest);
 }
 
@@ -668,7 +756,8 @@ export async function readAndValidateRegistry(manifest, publicClient = client) {
   return assertRegistrySnapshotMatchesManifest(snapshot, manifest);
 }
 
-export function vercelRuntimeValues(snapshot) {
+export function vercelRuntimeValues(snapshot, manifest = null) {
+  const audit = manifest?.independentAudit;
   return Object.freeze({
     REGISTRY_ADDRESS: snapshot.registryAddress,
     PROJECT_AUTHORITY_ADDRESS: snapshot.projectAuthority,
@@ -678,16 +767,24 @@ export function vercelRuntimeValues(snapshot) {
     ELIGIBILITY_POLICY_HASH: snapshot.eligibilityPolicyHash,
     ELIGIBILITY_PROVIDER_MODE: "external",
     ALLOW_BOUNDED_STATS_FALLBACK: "false",
+    ...(audit?.status === "verified" ? {
+      INDEPENDENT_AUDIT_REPORT_URL: audit.reportUrl,
+      INDEPENDENT_AUDIT_SHA256: audit.sha256,
+      INDEPENDENT_AUDIT_FIRM: audit.firm,
+      INDEPENDENT_AUDIT_COMPLETED_AT: audit.completedAt,
+      INDEPENDENT_AUDIT_SOURCE_COMMIT: audit.scope.sourceCommit,
+    } : {}),
   });
 }
 
-export function vercelRuntimeSyncCommands(snapshot) {
-  const remove = LEGACY_VERCEL_RUNTIME_KEYS.map((name) => Object.freeze({
+export function vercelRuntimeSyncCommands(snapshot, manifest = null) {
+  const remove = [...LEGACY_VERCEL_RUNTIME_KEYS, ...AUDIT_VERCEL_RUNTIME_KEYS]
+    .map((name) => Object.freeze({
     action: "remove",
     name,
     args: ["vercel", "env", "rm", name, "production", "--yes"],
-  }));
-  const add = Object.entries(vercelRuntimeValues(snapshot)).map(([name, value]) => Object.freeze({
+    }));
+  const add = Object.entries(vercelRuntimeValues(snapshot, manifest)).map(([name, value]) => Object.freeze({
     action: "add",
     name,
     value,
@@ -714,9 +811,9 @@ async function removeLegacyVercelRuntime(command) {
   throw new Error(`Failed to remove stale Vercel Production variable ${command.name}.`);
 }
 
-async function syncVercelRuntime(snapshot) {
-  const commands = vercelRuntimeSyncCommands(snapshot);
-  console.log("\nRemoving legacy direct-address Vercel Production bindings:");
+async function syncVercelRuntime(snapshot, manifest) {
+  const commands = vercelRuntimeSyncCommands(snapshot, manifest);
+  console.log("\nRemoving stale direct-address and audit-evidence Vercel Production bindings:");
   for (const command of commands.filter(({ action }) => action === "remove")) {
     console.log(`  REMOVE ${command.name}`);
     await removeLegacyVercelRuntime(command);
@@ -828,7 +925,7 @@ export async function prepareInactiveProductionSite({
   promoteImpl = promoteProductionCandidateAtCommit,
 }) {
   assertInactivePrepareState(manifest, snapshot);
-  await syncImpl(snapshot);
+  await syncImpl(snapshot, manifest);
   const candidate = await candidateDeployImpl(codeCommit, { codeCommitLoader });
   await promoteImpl(candidate.candidateUrl, codeCommit, { codeCommitLoader });
   return Object.freeze({
@@ -929,6 +1026,22 @@ export function assertRuntimeReady(runtime, { ca, snapshot, manifest }) {
     .map(([name]) => name);
   for (const name of missingChecks) if (!failedChecks.includes(name)) failedChecks.push(name);
   const stockRegistry = runtime?.operations?.stockAssetRegistry;
+  const audit = runtime?.operations?.independentAudit;
+  const manifestAudit = manifest?.independentAudit;
+  const auditEvidenceReady = audit?.status === "VERIFIED"
+    && audit.manifestBound === true
+    && audit.verified === true
+    && audit.reportUrl === manifestAudit?.reportUrl
+    && audit.sha256 === manifestAudit?.sha256
+    && audit.firm === manifestAudit?.firm
+    && audit.completedAt === manifestAudit?.completedAt
+    && audit.scope?.manifestId === manifestAudit?.scope?.manifestId
+    && audit.scope?.protocolVersion === manifestAudit?.scope?.protocolVersion
+    && same(audit.scope?.registry, manifestAudit?.scope?.registry)
+    && same(audit.scope?.gatewayImplementation, manifestAudit?.scope?.gatewayImplementation)
+    && audit.scope?.gatewayImplementationRuntimeCodeHash
+      === manifestAudit?.scope?.gatewayImplementationRuntimeCodeHash
+    && audit.scope?.sourceCommit === manifestAudit?.scope?.sourceCommit;
   const releaseManifest = runtime?.releaseManifest;
   const operationsReady = runtime?.operations?.environment === "production"
     && runtime.operations.eligibilityProviderMode === "external"
@@ -939,6 +1052,7 @@ export function assertRuntimeReady(runtime, { ca, snapshot, manifest }) {
     && runtime.operations.distributedRateLimitHealthy === true
     && runtime.operations.monitoringHealthy === true
     && runtime.operations.independentAuditVerified === true
+    && auditEvidenceReady
     && stockRegistry?.verified === true
     && stockRegistry.tokenSymbol === "QQQ"
     && stockRegistry.status === "ASSET_STATUS_ACTIVE"
@@ -1403,6 +1517,7 @@ export async function runProductionGate({
     runtimeExpiresAt: runtime.expiresAt,
     runtimeChecks: runtime.checks,
     operations: runtime.operations,
+    independentAudit: runtime.operations.independentAudit,
     eligibilityExpiresAt: eligibility.expiresAt,
     quoteExpiresAt: quote.expiresAt,
     quoteSimulatedAtBlock: quote.quoteSource.simulatedAtBlock,
@@ -1509,7 +1624,7 @@ async function launchOfficialCa(ca, {
   }
 
   console.log("\nSynchronizing and staging the manifest-bound Production candidate.");
-  await syncVercelRuntime(snapshot);
+  await syncVercelRuntime(snapshot, manifest);
   const artifact = await releaseProductionCandidate({
     manifest,
     operatorControlProof,

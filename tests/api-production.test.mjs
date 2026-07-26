@@ -41,6 +41,7 @@ import {
 } from "../server/operations.js";
 import {
   applySlippage,
+  calculateQuoteDeadlines,
   calculateSplit,
   createQuote,
 } from "../server/quote.js";
@@ -75,9 +76,32 @@ const TEST_PRIVATE_KEY =
   "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const POLICY_HASH = `0x${"ab".repeat(32)}`;
 const IMPLEMENTATION_CODE_HASH = `0x${"12".repeat(32)}`;
+const TEST_AUDIT_BYTES = Buffer.from("%PDF-1.7\nindependent audit fixture\n%%EOF\n");
+const TEST_AUDIT_SHA256 = createHash("sha256").update(TEST_AUDIT_BYTES).digest("hex");
+const TEST_AUDIT_SOURCE_COMMIT = "de".repeat(20);
+
+function verifiedAuditEvidence(manifest, overrides = {}) {
+  return {
+    status: "verified",
+    reportUrl: "https://auditor.example/report.pdf",
+    sha256: TEST_AUDIT_SHA256,
+    firm: "Independent Security Lab",
+    completedAt: "2026-07-01T00:00:00.000Z",
+    scope: {
+      manifestId: manifest.manifestId,
+      protocolVersion: manifest.protocolVersion,
+      registry: manifest.registry,
+      gatewayImplementation: manifest.gatewayImplementation,
+      gatewayImplementationRuntimeCodeHash: manifest.gatewayImplementationRuntimeCodeHash,
+      sourceCommit: TEST_AUDIT_SOURCE_COMMIT,
+    },
+    ...overrides,
+  };
+}
 
 function activeReleaseManifest(overrides = {}) {
-  return {
+  const { independentAudit, ...manifestOverrides } = overrides;
+  const manifest = {
     ...PRODUCTION_RELEASE_MANIFEST,
     tradingActive: true,
     currentOfficialToken: ADDRESSES.official,
@@ -91,7 +115,13 @@ function activeReleaseManifest(overrides = {}) {
     eligibilityAuthority: privateKeyToAccount(TEST_PRIVATE_KEY).address,
     eligibilityPolicyHash: POLICY_HASH,
     stockAdapter: ADDRESSES.stockAdapter,
-    ...overrides,
+    ...manifestOverrides,
+  };
+  return {
+    ...manifest,
+    independentAudit: independentAudit === undefined
+      ? verifiedAuditEvidence(manifest)
+      : independentAudit,
   };
 }
 
@@ -108,6 +138,11 @@ function productionReleaseConfig(manifest, overrides = {}) {
       OFFICIAL_TOKEN_ADDRESS: manifest.currentOfficialToken,
       GATEWAY_ADDRESS: manifest.currentMarket,
       GATEWAY_ACTIVATED_BLOCK: String(manifest.currentActivatedBlock),
+      INDEPENDENT_AUDIT_REPORT_URL: manifest.independentAudit?.reportUrl,
+      INDEPENDENT_AUDIT_SHA256: manifest.independentAudit?.sha256,
+      INDEPENDENT_AUDIT_FIRM: manifest.independentAudit?.firm,
+      INDEPENDENT_AUDIT_COMPLETED_AT: manifest.independentAudit?.completedAt,
+      INDEPENDENT_AUDIT_SOURCE_COMMIT: manifest.independentAudit?.scope?.sourceCommit,
       STOCK_TOKEN_ADDRESS: ADDRESSES.stock,
       CHAIN_QUOTER_ADDRESS: ADDRESSES.quoter,
       ELIGIBILITY_SIGNER_PRIVATE_KEY: TEST_PRIVATE_KEY,
@@ -507,7 +542,8 @@ test("external provider responses require a fresh HMAC and future expiry", async
 
 test("operational readiness verifies index health and the audit report digest", async () => {
   __resetOperationalCachesForTests();
-  const auditBytes = Buffer.from("%PDF-1.7\nindependent audit fixture\n%%EOF\n");
+  const auditBytes = TEST_AUDIT_BYTES;
+  const releaseManifest = activeReleaseManifest();
   const indexerSecret = "i".repeat(40);
   const rateSecret = "l".repeat(40);
   const monitorSecret = "m".repeat(40);
@@ -527,10 +563,11 @@ test("operational readiness verifies index health and the audit report digest", 
     MONITORING_WEBHOOK_URL: "https://monitor.example/events",
     MONITORING_WEBHOOK_TOKEN: "monitor-token-value",
     MONITORING_WEBHOOK_HMAC_SECRET: monitorSecret,
-    INDEPENDENT_AUDIT_REPORT_URL: "https://auditor.example/report.pdf",
-    INDEPENDENT_AUDIT_SHA256: createHash("sha256").update(auditBytes).digest("hex"),
-    INDEPENDENT_AUDIT_FIRM: "Independent Security Lab",
-    INDEPENDENT_AUDIT_COMPLETED_AT: "2026-07-01T00:00:00.000Z",
+    INDEPENDENT_AUDIT_REPORT_URL: releaseManifest.independentAudit.reportUrl,
+    INDEPENDENT_AUDIT_SHA256: releaseManifest.independentAudit.sha256,
+    INDEPENDENT_AUDIT_FIRM: releaseManifest.independentAudit.firm,
+    INDEPENDENT_AUDIT_COMPLETED_AT: releaseManifest.independentAudit.completedAt,
+    INDEPENDENT_AUDIT_SOURCE_COMMIT: releaseManifest.independentAudit.scope.sourceCommit,
   });
   let healthCalls = 0;
   const fetchImpl = async (url, options) => {
@@ -585,6 +622,7 @@ test("operational readiness verifies index health and the audit report digest", 
   };
   const result = await checkOperationalReadiness(config, {
     fetchImpl,
+    releaseManifest,
   });
   assert.deepEqual(result.checks, {
     eligibilityProvider: true,
@@ -595,9 +633,50 @@ test("operational readiness verifies index health and the audit report digest", 
     stockAssetRegistry: true,
   });
   assert.equal(healthCalls, 5);
-  const cached = await checkOperationalReadiness(config, { fetchImpl });
+  assert.equal(result.publicValue.independentAudit.status, "VERIFIED");
+  assert.equal(result.publicValue.independentAudit.manifestBound, true);
+  assert.equal(result.publicValue.independentAudit.sha256, releaseManifest.independentAudit.sha256);
+  assert.equal(result.publicValue.independentAudit.scope.sourceCommit, TEST_AUDIT_SOURCE_COMMIT);
+  const cached = await checkOperationalReadiness(config, { fetchImpl, releaseManifest });
   assert.equal(cached, result);
   assert.equal(healthCalls, 5);
+});
+
+test("production audit metadata from env cannot self-authorize outside the sole manifest", async () => {
+  __resetOperationalCachesForTests();
+  const releaseManifest = activeReleaseManifest();
+  const attackerBytes = Buffer.from("%PDF-1.7\nself-attested report\n%%EOF\n");
+  const config = getServerConfig({
+    VERCEL_ENV: "production",
+    INDEPENDENT_AUDIT_REPORT_URL: "https://attacker.example/self-report.pdf",
+    INDEPENDENT_AUDIT_SHA256: createHash("sha256").update(attackerBytes).digest("hex"),
+    INDEPENDENT_AUDIT_FIRM: "Self Reported Lab",
+    INDEPENDENT_AUDIT_COMPLETED_AT: "2026-07-02T00:00:00.000Z",
+    INDEPENDENT_AUDIT_SOURCE_COMMIT: "aa".repeat(20),
+  });
+  let attackerReportFetches = 0;
+  const result = await checkOperationalReadiness(config, {
+    releaseManifest,
+    fetchImpl: async (url) => {
+      if (String(url).includes("attacker.example")) {
+        attackerReportFetches += 1;
+        return new Response(attackerBytes, {
+          status: 200,
+          headers: { "content-type": "application/pdf" },
+        });
+      }
+      return new Response("{}", { status: 503, headers: { "content-type": "application/json" } });
+    },
+  });
+  assert.equal(result.checks.independentAudit, false);
+  assert.equal(attackerReportFetches, 0, "untrusted env URL must never be fetched");
+  assert.equal(result.publicValue.independentAudit.status, "MANIFEST_MISMATCH");
+  assert.equal(result.publicValue.independentAudit.manifestBound, false);
+  assert.equal(
+    result.publicValue.independentAudit.reportUrl,
+    releaseManifest.independentAudit.reportUrl,
+    "public evidence must come only from the checked-in manifest",
+  );
 });
 
 test("official Stock registry requires one active, market-tradable canonical QQQ deployment", async () => {
@@ -740,6 +819,7 @@ test("production release manifest validates every reviewed control-plane field",
     ["stockAdapterSourceVerified", false],
     ["ponsAdapterFactorySourceVerified", false],
     ["maxAmountInWei", "999"],
+    ["independentAudit", null],
   ];
   for (const [field, value] of invalidFields) {
     assert.equal(
@@ -748,6 +828,32 @@ test("production release manifest validates every reviewed control-plane field",
       `${field} must be part of the reviewed manifest schema`,
     );
   }
+  const activeManifest = activeReleaseManifest();
+  assert.equal(isValidProductionReleaseManifest(activeManifest), true);
+  assert.equal(isValidProductionReleaseManifest({
+    ...activeManifest,
+    independentAudit: {
+      ...activeManifest.independentAudit,
+      sha256: "ab".repeat(32),
+      scope: {
+        ...activeManifest.independentAudit.scope,
+        registry: ADDRESSES.input,
+      },
+    },
+  }), false, "audit scope must bind the reviewed Registry");
+  assert.equal(isValidProductionReleaseManifest({
+    ...activeManifest,
+    independentAudit: PRODUCTION_RELEASE_MANIFEST.independentAudit,
+  }), false, "an active manifest cannot retain not-ready audit evidence");
+  const auditedInactiveManifest = {
+    ...PRODUCTION_RELEASE_MANIFEST,
+    independentAudit: verifiedAuditEvidence(PRODUCTION_RELEASE_MANIFEST),
+  };
+  assert.equal(
+    isValidProductionReleaseManifest(auditedInactiveManifest),
+    true,
+    "verified audit evidence may be pinned before market activation",
+  );
 });
 
 test("server runtime becomes READY only for an exact active manifest and onchain stack", async () => {
@@ -820,6 +926,7 @@ test("server runtime becomes READY only for an exact active manifest and onchain
     currentOfficialToken: null,
     currentMarket: null,
     currentActivatedBlock: 0,
+    independentAudit: PRODUCTION_RELEASE_MANIFEST.independentAudit,
   };
   const inactiveConfig = {
     ...productionReleaseConfig(inactiveManifest),
@@ -966,6 +1073,39 @@ test("Production confirmation depth cannot be configured to zero", () => {
   assert.equal(getServerConfig({ LOG_CONFIRMATIONS: "0" }).confirmations, 0);
 });
 
+test("quote deadlines never outlive eligibility and retain a safe chain-time window", () => {
+  const chainNow = 1_000n;
+  const providerExpiresAt = new Date(1_015_000).toISOString();
+  const deadlines = calculateQuoteDeadlines(chainNow, 45, providerExpiresAt);
+
+  assert.equal(deadlines.deadline, 1_015n);
+  assert.equal(deadlines.eligibilityDeadline, 1_015n);
+  assert.ok(deadlines.deadline <= deadlines.eligibilityDeadline);
+  assert.ok(deadlines.deadline > chainNow + 5n);
+  assert.ok(deadlines.eligibilityDeadline > chainNow + 5n);
+});
+
+test("quote deadline calculation fails closed without a safe submission window", () => {
+  assert.throws(
+    () => calculateQuoteDeadlines(1_000n, 45, new Date(1_005_000).toISOString()),
+    (error) => error instanceof ApiError
+      && error.status === 503
+      && error.code === "ELIGIBILITY_EXPIRED",
+  );
+  assert.throws(
+    () => calculateQuoteDeadlines(1_000n, 5, new Date(1_100_000).toISOString()),
+    (error) => error instanceof ApiError
+      && error.status === 503
+      && error.code === "QUOTE_TTL_INVALID",
+  );
+  assert.throws(
+    () => calculateQuoteDeadlines(1_000n, 45, "not-a-date"),
+    (error) => error instanceof ApiError
+      && error.status === 503
+      && error.code === "ELIGIBILITY_EXPIRED",
+  );
+});
+
 test("quote uses onchain Quoter outputs, signed eligibility, and full Gateway simulation", async () => {
   const signer = privateKeyToAccount(TEST_PRIVATE_KEY);
   const releaseManifest = activeReleaseManifest();
@@ -1032,6 +1172,7 @@ test("quote uses onchain Quoter outputs, signed eligibility, and full Gateway si
     },
   };
   let quoterCalls = 0;
+  const chainNow = BigInt(Math.floor(Date.now() / 1_000));
   const mockClient = {
     async call({ to }) {
       if (to.toLowerCase() === ADDRESSES.quoter) {
@@ -1055,7 +1196,7 @@ test("quote uses onchain Quoter outputs, signed eligibility, and full Gateway si
       };
     },
     async getBlock() {
-      return { number: 123n, timestamp: BigInt(Math.floor(Date.now() / 1_000)) };
+      return { number: 123n, timestamp: chainNow };
     },
   };
   const quote = await createQuote(config, {
@@ -1093,6 +1234,9 @@ test("quote uses onchain Quoter outputs, signed eligibility, and full Gateway si
   assert.equal(decoded.args[0], 98_000n);
   assert.equal(decoded.args[1], 980n);
   assert.equal(decoded.args.length, 6);
+  assert.ok(decoded.args[3] <= decoded.args[4]);
+  assert.ok(decoded.args[3] > chainNow + 5n);
+  assert.ok(decoded.args[4] > chainNow + 5n);
 
   const recovered = await recoverTypedDataAddress({
     ...quote.typedPayload,

@@ -83,6 +83,11 @@ function sha256Digest(value) {
   return /^[a-f0-9]{64}$/.test(normalized) ? normalized : null;
 }
 
+function gitCommit(value) {
+  const normalized = text(value).toLowerCase();
+  return /^[a-f0-9]{40}$/.test(normalized) ? normalized : null;
+}
+
 function hexBytes(value) {
   const normalized = text(value);
   return /^0x(?:[a-fA-F0-9]{2})+$/.test(normalized) ? normalized.toLowerCase() : null;
@@ -187,6 +192,7 @@ export function getServerConfig(env = process.env) {
     independentAuditSha256: sha256Digest(env.INDEPENDENT_AUDIT_SHA256),
     independentAuditFirm: text(env.INDEPENDENT_AUDIT_FIRM),
     independentAuditCompletedAt: text(env.INDEPENDENT_AUDIT_COMPLETED_AT),
+    independentAuditSourceCommit: gitCommit(env.INDEPENDENT_AUDIT_SOURCE_COMMIT),
     independentAuditTimeoutMs: integer(env.INDEPENDENT_AUDIT_TIMEOUT_MS, 5_000, 500, 15_000),
     independentAuditMaxBytes: integer(env.INDEPENDENT_AUDIT_MAX_BYTES, 5_000_000, 10_000, 10_000_000),
     corsAllowedOrigins: origins(env.CORS_ALLOWED_ORIGINS),

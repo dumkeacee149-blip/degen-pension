@@ -3,6 +3,8 @@ import { isAddressEqual } from "viem";
 
 const ADDRESS_PATTERN = /^0x[a-fA-F0-9]{40}$/;
 const HASH_PATTERN = /^0x[a-fA-F0-9]{64}$/;
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const COMMIT_PATTERN = /^[a-f0-9]{40}$/;
 const PRODUCTION_MANIFEST_ID = "robinhood-mainnet-production-v2";
 const PRODUCTION_CHAIN_ID = 4663;
 const PRODUCTION_PROTOCOL_VERSION = 2;
@@ -30,6 +32,78 @@ function sameUnsignedInteger(left, right) {
   } catch {
     return false;
   }
+}
+
+function normalizedHttpsUrl(value) {
+  try {
+    const parsed = new URL(String(value || ""));
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.hash) return null;
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
+function inactiveAuditEvidence(audit) {
+  return audit?.status === "not-ready"
+    && audit.reportUrl === null
+    && audit.sha256 === null
+    && audit.firm === null
+    && audit.completedAt === null
+    && audit.scope === null;
+}
+
+function verifiedAuditEvidence(manifest) {
+  const audit = manifest?.independentAudit;
+  const scope = audit?.scope;
+  return audit?.status === "verified"
+    && Boolean(normalizedHttpsUrl(audit.reportUrl))
+    && SHA256_PATTERN.test(String(audit.sha256 || ""))
+    && typeof audit.firm === "string"
+    && audit.firm.trim().length >= 2
+    && Number.isFinite(Date.parse(audit.completedAt || ""))
+    && scope?.manifestId === manifest.manifestId
+    && scope.protocolVersion === manifest.protocolVersion
+    && sameAddress(scope.registry, manifest.registry)
+    && sameAddress(scope.gatewayImplementation, manifest.gatewayImplementation)
+    && sameHash(
+      scope.gatewayImplementationRuntimeCodeHash,
+      manifest.gatewayImplementationRuntimeCodeHash,
+    )
+    && COMMIT_PATTERN.test(String(scope.sourceCommit || ""));
+}
+
+export function releaseManifestAuditConfigMatches(config, manifest = PRODUCTION_RELEASE_MANIFEST) {
+  if (!isValidProductionReleaseManifest(manifest) || !verifiedAuditEvidence(manifest)) return false;
+  const audit = manifest.independentAudit;
+  return normalizedHttpsUrl(config.independentAuditReportUrl) === normalizedHttpsUrl(audit.reportUrl)
+    && config.independentAuditSha256 === audit.sha256
+    && config.independentAuditFirm === audit.firm
+    && config.independentAuditCompletedAt === audit.completedAt
+    && config.independentAuditSourceCommit === audit.scope.sourceCommit;
+}
+
+export function publicIndependentAuditState(manifest = PRODUCTION_RELEASE_MANIFEST, {
+  manifestBound = false,
+  verified = false,
+} = {}) {
+  const audit = manifest?.independentAudit;
+  const evidenceReady = verifiedAuditEvidence(manifest);
+  const fullyVerified = evidenceReady && manifestBound === true && verified === true;
+  return Object.freeze({
+    status: fullyVerified
+      ? "VERIFIED"
+      : evidenceReady
+        ? (manifestBound ? "UNVERIFIED" : "MANIFEST_MISMATCH")
+        : "NOT_READY",
+    manifestBound: evidenceReady && manifestBound === true,
+    verified: fullyVerified,
+    reportUrl: evidenceReady ? audit.reportUrl : null,
+    sha256: evidenceReady ? audit.sha256 : null,
+    firm: evidenceReady ? audit.firm : null,
+    completedAt: evidenceReady ? audit.completedAt : null,
+    scope: evidenceReady ? Object.freeze({ ...audit.scope }) : null,
+  });
 }
 
 export function isValidProductionReleaseManifest(manifest) {
@@ -67,12 +141,14 @@ export function isValidProductionReleaseManifest(manifest) {
     return address(manifest.currentOfficialToken)
       && address(manifest.currentMarket)
       && Number.isSafeInteger(manifest.currentActivatedBlock)
-      && manifest.currentActivatedBlock > 0;
+      && manifest.currentActivatedBlock > 0
+      && verifiedAuditEvidence(manifest);
   }
   return manifest.tradingActive === false
     && manifest.currentOfficialToken === null
     && manifest.currentMarket === null
-    && manifest.currentActivatedBlock === 0;
+    && manifest.currentActivatedBlock === 0
+    && (inactiveAuditEvidence(manifest.independentAudit) || verifiedAuditEvidence(manifest));
 }
 
 export const PRODUCTION_RELEASE_MANIFEST = Object.freeze({ ...productionManifest });
@@ -86,6 +162,7 @@ export function releaseManifestConfigMatches(config, manifest = PRODUCTION_RELEA
     && sameHash(config.expectedImplementationCodeHash, manifest.gatewayImplementationRuntimeCodeHash)
     && sameAddress(config.expectedEligibilityChecker, manifest.eligibilityChecker)
     && sameHash(config.expectedEligibilityPolicyHash, manifest.eligibilityPolicyHash)
+    && (manifest.tradingActive !== true || releaseManifestAuditConfigMatches(config, manifest))
     && (!config.officialTokenAddress
       || sameAddress(config.officialTokenAddress, manifest.currentOfficialToken))
     && (!config.gatewayAddress || sameAddress(config.gatewayAddress, manifest.currentMarket))

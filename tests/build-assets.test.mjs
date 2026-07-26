@@ -27,6 +27,18 @@ test("serverless durations and source-upload exclusions match the runtime budget
   assert.match(ignored, /^public\/assets\/\*\.png$/m);
 });
 
+test("Open Graph metadata matches the shipped social image", async () => {
+  const html = await readFile(path.join(root, "index.html"), "utf8");
+  const image = await readFile(path.join(root, "public", "social", "og-99-1.png"));
+  assert.equal(image.subarray(1, 4).toString("ascii"), "PNG");
+  const width = image.readUInt32BE(16);
+  const height = image.readUInt32BE(20);
+  assert.equal(width, 1600);
+  assert.equal(height, 900);
+  assert.match(html, /property="og:image:width" content="1600"/);
+  assert.match(html, /property="og:image:height" content="900"/);
+});
+
 async function filesUnder(directory) {
   const output = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
