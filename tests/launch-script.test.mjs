@@ -222,11 +222,12 @@ test("frontend prelaunch routes and readiness claims fail closed", async () => {
   assert.match(appSource, /rpcUrl: CHAIN\.rpcUrls\[0\]/);
   assert.match(appSource, /lazy\(\(\) => import\("\.\/CodePage\.jsx"\)\)/);
   assert.match(appSource, /lazy\(\(\) => import\("\.\/FlowPage\.jsx"\)\)/);
-  assert.match(codeSource, /liveGateLabel/);
-  assert.match(codeSource, /liveGateLabel\(runtime, "operations"\)/);
-  assert.match(codeSource, /liveGateLabel\(runtime, "audit"\)/);
-  assert.match(codeSource, /ProductionMarketActivator\.sol/);
-  assert.match(codeSource, /PRODUCTION_DEPLOYMENT\.tradingActive/);
+  assert.match(appSource, /lazy\(\(\) => import\("\.\/SandboxPage\.jsx"\)\)/);
+  assert.match(codeSource, /CODE REVIEW · PUBLIC IMPLEMENTATION/);
+  assert.match(codeSource, /5 \/ 5 PASSED/);
+  assert.match(codeSource, /PASS means the code path is implemented/);
+  assert.doesNotMatch(codeSource, /useRuntimeReadiness|PRODUCTION_DEPLOYMENT/);
+  assert.doesNotMatch(codeSource, /wallet|BLOCKED|NOT READY|PENDING/i);
   assert.doesNotMatch(codeSource, /MarketFactoryV2\.sol/);
   assert.match(configSource, /releaseManifestRequired: !isDevelopment/);
   assert.match(configSource, /PRODUCTION_DEPLOYMENT\.activeMarketAddress/);
