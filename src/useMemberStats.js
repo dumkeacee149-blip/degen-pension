@@ -48,7 +48,7 @@ export function memberStatsBinding(runtime) {
 export function useMemberStats(runtime, refreshToken = 0, recipient = "") {
   const [stats, setStats] = useState(UNAVAILABLE_STATS);
   const gatewayAddress = memberStatsBinding(runtime);
-  const enabled = Boolean(gatewayAddress || MARKET.memberStatsEndpoint);
+  const enabled = Boolean(gatewayAddress && MARKET.memberStatsEndpoint);
   const normalizedRecipient = String(recipient || "").trim().toLowerCase();
 
   useEffect(() => {

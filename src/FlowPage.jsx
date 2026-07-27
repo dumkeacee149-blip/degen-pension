@@ -11,6 +11,7 @@ import {
   ShoppingCart,
   UsersThree,
 } from "@phosphor-icons/react";
+import { MARKET } from "./config.js";
 import { useMemberStats } from "./useMemberStats.js";
 import { useRuntimeReadiness } from "./useRuntimeReadiness.js";
 import "./flow-page.css";
@@ -43,15 +44,29 @@ function FlowBrand() {
   );
 }
 
-function memberCopy(stats, marketReady) {
+export function memberCopy(stats, marketReady) {
   if (!marketReady || stats.status === "prelaunch") {
-    return { number: "—", label: "OFFICIAL MEMBERS", line: "FIRST QUALIFYING BUY OPENS THE RECEIPT WALL" };
+    return { number: "PENDING", label: "OFFICIAL MEMBERS", line: "FIRST QUALIFYING BUY OPENS THE RECEIPT WALL" };
+  }
+  if (["unavailable", "idle", "pending"].includes(stats.status)) {
+    return { number: "…", label: "MEMBER INDEX PENDING", line: "WAITING FOR A VERIFIED CANONICAL SNAPSHOT" };
   }
   if (stats.status === "loading") {
     return { number: "...", label: "COUNTING THE WALL", line: "READING CANONICAL SPLITBUY EVENTS" };
   }
   if (stats.status === "error") {
     return { number: "?", label: "INDEX OFFLINE", line: "THE COUNTER WILL RETURN. THE CHAIN RECEIPTS REMAIN." };
+  }
+  if (stats.status === "stale") {
+    const count = Number.isSafeInteger(stats.memberCount) ? stats.memberCount : null;
+    return {
+      number: count === null ? "?" : count.toLocaleString("en-US"),
+      label: "LAST VERIFIED · STALE",
+      line: "NOT A LIVE COUNT · WAITING FOR A FRESH CANONICAL SNAPSHOT",
+    };
+  }
+  if (!Number.isSafeInteger(stats.memberCount)) {
+    return { number: "…", label: "MEMBER INDEX PENDING", line: "WAITING FOR A VERIFIED CANONICAL SNAPSHOT" };
   }
   const count = stats.memberCount || 0;
   return {
@@ -64,8 +79,10 @@ function memberCopy(stats, marketReady) {
 export function FlowPage() {
   const runtime = useRuntimeReadiness();
   const stats = useMemberStats(runtime);
-  const members = memberCopy(stats, runtime.ready);
   const marketActive = runtime.ready === true;
+  const marketRecorded = MARKET.releaseManifestActive === true;
+  const canonicalMarketRecorded = Boolean(runtime.canonical?.gatewayAddress);
+  const members = memberCopy(stats, canonicalMarketRecorded);
   const [shareLabel, setShareLabel] = useState("SHARE THE PLAN");
 
   useEffect(() => {
@@ -75,7 +92,9 @@ export function FlowPage() {
   const sharePlan = async () => {
     const text = marketActive
       ? "I found a retirement plan for people who buy meme coins: 99% $401KEK, 1% QQQ. 99% APE. 1% ADULT."
-      : "A pre-launch 99/1 split-buy idea: 99% $401KEK, 1% QQQ. Market not active. 99% APE. 1% ADULT.";
+      : marketRecorded
+        ? "The 99/1 market is recorded onchain, but public release gates are still blocked: 99% $401KEK, 1% QQQ. 99% APE. 1% ADULT."
+        : "A pre-launch 99/1 split-buy idea: 99% $401KEK, 1% QQQ. Market not active. 99% APE. 1% ADULT.";
     try {
       if (navigator.share) {
         await navigator.share({ title: "DEGEN PENSION", text, url: window.location.origin });
@@ -105,14 +124,24 @@ export function FlowPage() {
         <section className="flow-hero">
           <div className="flow-hero-copy">
             <div className={`flow-market-state ${marketActive ? "is-active" : "is-prelaunch"}`} role="status">
-              <span>{marketActive ? "OFFICIAL 99/1 ROUTE" : "PRE-LAUNCH PROTOTYPE"}</span>
-              <strong>{marketActive ? "RUNTIME CHECKS PASSED" : "MARKET NOT ACTIVE"}</strong>
+              <span>{marketActive
+                ? "OFFICIAL 99/1 ROUTE"
+                : marketRecorded
+                  ? "MANIFEST MARKET RECORDED"
+                  : "PRE-LAUNCH PROTOTYPE"}</span>
+              <strong>{marketActive
+                ? "RUNTIME CHECKS PASSED"
+                : marketRecorded
+                  ? "PUBLIC RELEASE GATES BLOCKED"
+                  : "MARKET NOT ACTIVE"}</strong>
             </div>
             <span className="flow-kicker">THE RETIREMENT PLAN YOUR GROUP CHAT DESERVES</span>
             <h1>BUY THE MEME.<br /><em>MAKE 1% GROW UP.</em></h1>
             <p>{marketActive
               ? "The official route buys $401KEK and QQQ together, then prints proof that your wallet joined the worst pension club online."
-              : "This page explains the intended 99/1 route. Trading is not active: no wallet, quote, or transaction runs here until the official market opens."}</p>
+              : marketRecorded
+                ? "The reviewed manifest records the official CA and Gateway, but wallet, quote and transaction controls stay disabled until every live release gate passes."
+                : "This page explains the intended 99/1 route. Trading is not active: no wallet, quote, or transaction runs here until the official market opens."}</p>
             <div className="flow-hero-actions">
               <a className="flow-primary" href="/">{marketActive ? "OPEN 99/1" : "RETURN TO PROJECT"} <ArrowRight size={20} weight="bold" /></a>
               <button className="flow-secondary" type="button" onClick={sharePlan}><ShareNetwork size={18} weight="bold" />{shareLabel}</button>
@@ -128,7 +157,9 @@ export function FlowPage() {
             <h2 id="three-beat-heading">THE WHOLE TRICK IN THREE BEATS.</h2>
             <p>{marketActive
               ? "No wallet on arrival. No mystery pool. No separate claim."
-              : "INTENDED FLOW ONLY · NO ACTIVE MARKET · NO TRANSACTION ON THIS PAGE"}</p>
+              : marketRecorded
+                ? "MANIFEST MARKET RECORDED · PUBLIC BUY GATES BLOCKED · NO TRANSACTION ON THIS PAGE"
+                : "INTENDED FLOW ONLY · NO ACTIVE MARKET · NO TRANSACTION ON THIS PAGE"}</p>
           </header>
           <div className="beat-grid">
             {THREE_BEATS.map(({ title, Icon, copy }, index) => (
@@ -160,9 +191,6 @@ export function FlowPage() {
             <p>A successful official buy unlocks a social object that is tied to the canonical SplitBuy event, not a screenshot anyone can fake.</p>
             <div className="receipt-preview" aria-label="Retirement receipt preview">
               <header><span>DEGEN PENSION</span><b>OFFICIAL 99/1 RECEIPT</b></header>
-              {marketActive && (
-                <div className="receipt-number"><small>MEMBER NUMBER</small><strong>{members.number}</strong></div>
-              )}
               <div className="receipt-assets">
                 <span><img src="/assets/badge-401kek-v1.webp" alt="401KEK badge" /><b>99% MEME</b></span>
                 <span><img src="/assets/badge-qqq-v1.webp" alt="QQQ badge" /><b>1% ADULT</b></span>
@@ -202,16 +230,16 @@ export function FlowPage() {
           </details>
         </section>
 
-        <section className={`receipt-wall ${marketActive ? "" : "receipt-wall-prelaunch"}`}>
-          {marketActive && (
+        <section className={`receipt-wall ${canonicalMarketRecorded ? "" : "receipt-wall-prelaunch"}`}>
+          {canonicalMarketRecorded && (
             <div className="wall-count">
               <span>{members.label}</span>
               <strong>{members.number}</strong>
             </div>
           )}
           <div>
-            <h2>{marketActive ? "THE WALL IS ONCHAIN." : "THE WALL OPENS WITH THE MARKET."}</h2>
-            <p>{marketActive ? "Every number is backed by a unique recipient in confirmed official SplitBuy events." : "No placeholder count, fake avatars, or invented volume. The first member number appears only after a confirmed official SplitBuy event."}</p>
+            <h2>{canonicalMarketRecorded ? "THE WALL READS THE CHAIN." : "THE WALL OPENS WITH THE MARKET."}</h2>
+            <p>{canonicalMarketRecorded ? "Every number is backed by a unique recipient in confirmed official SplitBuy events, even while public buying remains blocked." : "No placeholder count, fake avatars, or invented volume. The first member number appears only after a confirmed official SplitBuy event."}</p>
           </div>
           <a href="/">{marketActive ? "BUY 99/1" : "RETURN HOME"}<ArrowRight size={20} weight="bold" /></a>
         </section>

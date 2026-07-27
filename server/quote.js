@@ -13,10 +13,16 @@ import {
 } from "./constants.js";
 import { decideEligibility } from "./eligibility.js";
 import { ApiError } from "./http.js";
+import {
+  PRODUCTION_RELEASE_MANIFEST,
+  isValidProductionReleaseManifest,
+  releaseManifestRuntimeMatches,
+} from "./release-manifest.js";
 import { getPublicClient, loadRuntime } from "./runtime.js";
 
 const BPS_DENOMINATOR = 10_000n;
 const PROJECT_BPS = 9_900n;
+const QUOTE_SUBMISSION_SAFETY_SECONDS = 5n;
 
 export function calculateSplit(grossAmountIn, explicitFeeBps) {
   const fee = grossAmountIn * BigInt(explicitFeeBps) / BPS_DENOMINATOR;
@@ -33,6 +39,46 @@ export function applySlippage(amountOut, slippageBps) {
   const minimum = amountOut * (BPS_DENOMINATOR - BigInt(slippageBps)) / BPS_DENOMINATOR;
   if (minimum <= 0n) throw new ApiError(503, "QUOTE_TOO_SMALL", "Quoted output is too small.");
   return minimum;
+}
+
+export function calculateQuoteDeadlines(chainTimestamp, quoteTtlSeconds, eligibilityExpiresAt) {
+  let chainNow;
+  try {
+    chainNow = BigInt(chainTimestamp);
+  } catch {
+    throw new ApiError(503, "CHAIN_TIME_INVALID", "The latest block timestamp is invalid.");
+  }
+  if (chainNow < 0n) {
+    throw new ApiError(503, "CHAIN_TIME_INVALID", "The latest block timestamp is invalid.");
+  }
+  if (
+    !Number.isSafeInteger(quoteTtlSeconds)
+    || BigInt(quoteTtlSeconds) <= QUOTE_SUBMISSION_SAFETY_SECONDS
+  ) {
+    throw new ApiError(503, "QUOTE_TTL_INVALID", "Quote TTL does not leave a safe submission window.");
+  }
+
+  const providerExpiryMs = Date.parse(eligibilityExpiresAt);
+  if (!Number.isFinite(providerExpiryMs)) {
+    throw new ApiError(503, "ELIGIBILITY_EXPIRED", "Eligibility returned an invalid expiration.");
+  }
+  const providerDeadline = BigInt(Math.floor(providerExpiryMs / 1_000));
+  const configuredDeadline = chainNow + BigInt(quoteTtlSeconds);
+  const commonDeadline = configuredDeadline < providerDeadline
+    ? configuredDeadline
+    : providerDeadline;
+  if (commonDeadline <= chainNow + QUOTE_SUBMISSION_SAFETY_SECONDS) {
+    throw new ApiError(
+      503,
+      "ELIGIBILITY_EXPIRED",
+      "Eligibility does not leave enough time to submit the quote safely.",
+    );
+  }
+
+  return {
+    deadline: commonDeadline,
+    eligibilityDeadline: commonDeadline,
+  };
 }
 
 async function quoteExactInput(client, quoterAddress, path, amountIn, account) {
@@ -166,6 +212,7 @@ export async function createQuote(config, {
   runtimeLoader = loadRuntime,
   clientFactory = getPublicClient,
   eligibilityDecider = decideEligibility,
+  releaseManifest = PRODUCTION_RELEASE_MANIFEST,
 }) {
   if (wallet.toLowerCase() !== recipient.toLowerCase()) {
     throw new ApiError(
@@ -174,11 +221,30 @@ export async function createQuote(config, {
       "Production eligibility currently requires payer and recipient to be the same wallet.",
     );
   }
+  const production = config.vercelEnvironment === "production";
+  if (production && !isValidProductionReleaseManifest(releaseManifest)) {
+    throw new ApiError(503, "RELEASE_MANIFEST_INVALID", "The checked-in production release manifest is invalid.");
+  }
+  if (production && releaseManifest.tradingActive !== true) {
+    throw new ApiError(
+      503,
+      "RELEASE_MANIFEST_INACTIVE",
+      "The checked-in production release manifest has not authorized trading.",
+    );
+  }
+  if (production && (!Number.isSafeInteger(config.confirmations) || config.confirmations < 1)) {
+    throw new ApiError(503, "CONFIRMATIONS_INVALID", "Production quotes require confirmed onchain state.");
+  }
   const runtime = await runtimeLoader(config, { fresh: true });
-  if (!runtime.ready) {
-    const failedChecks = Object.entries(runtime.checks)
+  const releaseManifestBound = !production
+    || releaseManifestRuntimeMatches(config, runtime, releaseManifest);
+  if (!runtime.ready || !releaseManifestBound) {
+    const failedChecks = Object.entries(runtime.checks || {})
       .filter(([, passed]) => !passed)
       .map(([name]) => name);
+    if (production && !releaseManifestBound && !failedChecks.includes("releaseManifest")) {
+      failedChecks.push("releaseManifest");
+    }
     throw new ApiError(503, "MARKET_NOT_READY", "The complete production market is not ready.", {
       status: runtime.status,
       failedChecks,
@@ -211,13 +277,11 @@ export async function createQuote(config, {
   ]);
   const minProjectOut = applySlippage(projectQuote.amountOut, slippageBps);
   const minStockOut = applySlippage(stockQuote.amountOut, slippageBps);
-  const chainNow = Number(latestBlock.timestamp);
-  const deadline = BigInt(chainNow + config.quoteTtlSeconds);
-  const providerExpiry = Math.floor(Date.parse(eligibility.expiresAt) / 1_000);
-  const eligibilityDeadline = BigInt(Math.min(Number(deadline), providerExpiry));
-  if (Number(eligibilityDeadline) <= chainNow) {
-    throw new ApiError(503, "ELIGIBILITY_EXPIRED", "Eligibility expired before quote creation.");
-  }
+  const { deadline, eligibilityDeadline } = calculateQuoteDeadlines(
+    latestBlock.timestamp,
+    config.quoteTtlSeconds,
+    eligibility.expiresAt,
+  );
 
   const eligibilityProof = await signEligibility(
     config,

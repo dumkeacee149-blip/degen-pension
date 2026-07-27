@@ -1,0 +1,15 @@
+# Source/master artwork is retained locally but is not needed by the deployed app.
+# Runtime WebP files, the favicon, and the OG image remain included.
+public/assets/social/
+public/assets/*.png
+public/brand/mark-99-1-v2.png
+public/brand/wordmark.png
+public/social/ca-loading.png
+public/social/market-ready-template.png
+
+audit-current/
+audit-raccoon-fidelity/
+audit-user-perspective/
+audit-revision/*.png
+design-sources/generated/
+qa/

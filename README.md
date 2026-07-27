@@ -25,19 +25,20 @@ npm run verify
 
 ## 生产边界
 
-当前仓库包含真实生产交易链路，但市场在链上 Registry 完成 CA 激活前始终失败闭锁。它不是经纪、养老或投资建议服务。
+当前只是公开 pre-launch 站点，**不可承载真实资金**。仓库包含生产 V2 候选链路和发布门禁，但官方 CA、可用的 launch-operator 控制证明、外部资格服务、链上签名密钥、可信统计索引、共享限流、监控、独立合约审计和小额主网 canary 尚未全部就绪。任一项缺失都必须保持 `NO-GO`。它不是经纪、养老或投资建议服务。
 
 - 页面不展示伪造余额、价格、输出数量、人数或成交状态。未激活时只显示 `PENDING`/blocked。
-- CA、Gateway、Adapter、路径和激活区块不编译进生产页面，全部从链上 `ProductionMarketActivator` 读取并复核。
+- `contracts/deployments/robinhood-mainnet.json` 是唯一生产 V2 部署清单。服务端从其 Registry 读取 CA、Gateway、Adapter、路径和激活区块并逐项复核；前端不内置可交易的 CA 或 Gateway。
 - 报价服务调用真实 Quoter V2，应用滑点下限，签发短时资格证明，再用完整 Gateway calldata、真实 payer/value 执行 `eth_call`；任一步失败都不返回可发送交易。
 - Stock Token 的可用性取决于资产状态、流动性、价格源和用户资格；不满足任一条件时，Gateway 应失败闭锁。
+- `/api/runtime` 会限时、限长且禁止重定向地读取 Robinhood 官方资产注册表；只有 chain `4663` 上唯一匹配 canonical QQQ、状态为 `ACTIVE`，且 market whole/fractional 都为 `TRADABLE` 时，`stockAssetRegistry` 才为绿。代码中的固定地址不能替代这项动态复核。
 - 不承诺价格、收益、流动性、成交、退休保障或本金安全。
 
 详细规则见 [项目计划](docs/PROJECT_PLAN.md)、[发布 Runbook](docs/LAUNCH_RUNBOOK.md)、[品牌 Playbook](docs/BRAND_PLAYBOOK.md) 与 [Robinhood Chain 配置核验记录](docs/VERIFIED_CHAIN_CONFIG.md)。
 
 ## 网站数据口径
 
-首页不在加载时请求钱包权限。首页角色阶段读取官方代币的 Blockscout holder 数；收据墙的 `PENSION MEMBERS` 则通过服务端只读 RPC 统计 canonical Gateway 的 `SplitBuy` 日志：筛选 `stockAmountOut > 0` 后，按 `recipient` 去重。两者口径明确分离。
+首页不在加载时请求钱包权限。首页角色阶段读取官方代币 holder 数；收据墙的 `PENSION MEMBERS` 只统计 canonical Gateway 已确认的 `SplitBuy` 事件：筛选 `stockAmountOut > 0` 后按 `recipient` 去重。生产环境必须通过签名响应的 durable indexer 读取这些统计；有界 RPC 扫描只允许在显式开启的本地开发环境使用。三种口径不得混用或伪造。
 
 首页不预填或展示任意 ETH 金额。市场上线后，点击 `BUY 99/1` 才打开金额层；只有用户填写金额、接受条款并确认后才请求钱包连接。上线配置参考 [`.env.example`](.env.example)；Registry 未激活时页面保持 `CA: PENDING`，不展示伪造人数，也不会请求交易。
 
@@ -45,7 +46,7 @@ npm run verify
 
 对外项目介绍与用户工作流程展示在 `/flow` 页面：覆盖产品是什么、每笔 99/1 买入如何完成、资金如何分流、用户收到什么、成交后资产如何变化，以及哪些行为不属于官方 99/1 买入。
 
-CA 出现后的唯一变量交易是 `activatePonsMarket(officialCA)`；Foundry 脚本见 [`contracts/script/ActivatePonsMarket.s.sol`](contracts/script/ActivatePonsMarket.s.sol)。仓库内不保存裸私钥或助记词。
+已部署 Registry 的链上激活调用只接收 `activatePonsMarket(officialCA)`，但这不等于“上线只差 CA”。该调用只能由 immutable launch operator `0x9F2A…d783` 执行；project authority `0x1373…247` 不能代替它。当前唯一 manifest 的 `tradingActive=false`，所以即使链上被单独激活，server runtime 与 quote 也会继续闭锁。激活后仍必须更新并复核唯一 manifest，再通过 runtime、eligibility、quote、独立 `eth_call` 和小额主网 canary 全部门禁。Foundry 脚本见 [`contracts/script/ActivatePonsMarket.s.sol`](contracts/script/ActivatePonsMarket.s.sol)；仓库内不保存裸私钥或助记词。
 
 ## 传播资产
 

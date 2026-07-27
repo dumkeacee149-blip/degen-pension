@@ -2,7 +2,7 @@
 
 ## 1. 产品定义
 
-DEGEN PENSION 为第三方项目币提供一个非托管 99/1 买入入口。用户提交一笔稳定币本金，Gateway 在同一笔原子交易中将本金拆成两腿：
+DEGEN PENSION 为第三方项目币提供一个非托管 99/1 买入入口。当前 Production V2 候选路径接收 Robinhood Chain 原生 ETH，在 Gateway 内包装为 WETH 后，于同一笔原子交易中拆成两腿：
 
 - 99% 用于买入用户明确选择的项目币；
 - 1% 用于买入当前市场配置中明确披露的合格 Stock Token。
@@ -60,8 +60,8 @@ totalDebit    = G
 - 合约代码已存在于目标链；
 - CA 能与受支持发行平台的链上创建记录、Factory 映射或项目方可验证发布记录对应；
 - Token 与目标交易池、结算资产及受支持 Adapter 的关系已在链上校验；
-- 一次性 EIP-712 Market Manifest 包含该 CA、链 ID、Pool、Adapter、99/1 配置和有效期，并由授权 Attestor 签署；
-- Manifest 与准备发布的项目官方公告完全一致。
+- CA 必须由受支持的 Pons Factory 记录为已发行 Token，配对资产是 canonical WETH，费率和 Token 自身记录的 Pool 与 canonical V3 Pool 一致；
+- 只能由唯一 Production V2 清单中的 immutable launch operator 调用 `activatePonsMarket(officialCA)`，且激活 Receipt 必须写回并复核同一清单。
 
 不得在文档、界面或推文中预填猜测地址。CA 未知、冲突或无法验证时，市场状态必须保持 `NOT_READY`。
 
@@ -72,7 +72,7 @@ totalDebit    = G
 - 地址来自受控的版本化部署清单；
 - 链 ID、运行时代码哈希和版本与清单一致；
 - 前端域名与 Gateway 地址均经过发布负责人复核；
-- 当前 Market Manifest 绑定的 Gateway 与用户即将调用的地址一致；
+- 链上 Registry 的 `currentMarket` 、`isMarket` 、激活区块与经评审的唯一部署清单一致；
 - 没有使用社交媒体回复、私信或 URL 参数提供的替代地址。
 
 本仓库文档不记录任何尚未核验的 Gateway 或资产地址。生产环境应从受控配置加载，并在运行时再次验证。
@@ -81,15 +81,16 @@ totalDebit    = G
 
 只有以下检查全部为真，市场才可进入 `MarketReady`：
 
-- 项目 CA、Factory、Pool 和 Adapter 验证通过；
+- 项目 CA、Production V2 Registry、Pool 和 Adapter 验证通过；
 - 项目币腿存在满足最低流动性与滑点要求的可执行路径；
 - Stock Token 是目标链官方资产注册表中的 canonical 合约；
 - Stock Token 状态可用，底层资产未停牌；
 - 价格源新鲜、未暂停，L2 Sequencer 状态满足安全要求；
 - Stock Token 腿存在有效 RFQ 或受支持 AMM 路径；
-- 99/1 比例、费用、限制和 Manifest 均一致且未过期；
-- 用户资格服务可用；
-- 一笔代表性订单的只读模拟成功；
+- 99/1 比例、费用、限制和已复核的激活清单一致；
+- 外部资格服务、与链上 checker 匹配的签名者、可信统计索引、共享限流和监控全部健康；
+- 独立合约审计报告已发布，且 runtime 校验的 PDF SHA-256 与发布记录一致；
+- 双腿 quote、对完整 Gateway calldata 的独立 `eth_call` 和小额主网 canary 均成功；
 - 官方 Gateway、前端域名和推文模板已完成双人复核。
 
 任何未知、超时或不一致状态均按失败处理，而不是按“可能可用”处理。
@@ -114,9 +115,9 @@ MVP 聚焦单链、单一结算资产和受控的少量 Adapter：
 
 - 固定 99/1，不提供自定义权重；
 - 每个 Market 只绑定一个明确披露的 Stock Token；
-- 生产环境只支持经过独立安全评估和白名单化的项目交易 Adapter；当前仓库中的 Mock Adapter 仅供测试；
-- 预先部署并测试 Factory 与 Gateway Implementation；CA 出现后由 Factory 在单笔交易中创建并初始化一个轻量 EIP-1167 Market Clone；
-- 使用 Permit2 或等效的限额授权；
+- 生产环境只支持在 `ProductionMarketActivator` 构造时固定的 Pons 项目 Adapter Factory 和 canonical QQQ Adapter；Mock Adapter 仅供测试；
+- 预先部署并锁定 Production V2 Registry、Gateway Implementation、EligibilityChecker 和 Adapters；CA 出现后由 immutable launch operator 在单笔交易中创建并初始化 EIP-1167 Gateway Clone；
+- 当前 `buyNative` 路径只使用用户在该交易中提供的 ETH，不请求 ERC-20 无限授权；
 - 不接受用户提供的任意 Call Target；
 - 不支持 Fee-on-transfer、Rebase 或无法可靠测量余额增量的项目币；
 - 不提供收益、借贷、杠杆、自动复投或长期资产管理。

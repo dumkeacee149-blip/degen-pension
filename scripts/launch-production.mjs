@@ -1,13 +1,15 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
+import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
 import {
   createPublicClient,
+  decodeEventLog,
+  decodeFunctionData,
+  decodeFunctionResult,
   formatEther,
   getAddress,
   http,
@@ -15,27 +17,81 @@ import {
   isAddressEqual,
   keccak256,
   parseAbi,
+  recoverMessageAddress,
   zeroAddress,
 } from "viem";
 
+// This address is the immutable project authority, not the launch operator.
+// Keep the legacy export because the public deployment record imports it.
 export const CONTROL_WALLET = "0x1373910FB6A73b640CdFBd980a776ED88f924247";
 export const ELIGIBILITY_AUTHORITY = "0xE1f58F712f7A98D37D82CaD9F039e2c9b0f0b367";
 export const ELIGIBILITY_POLICY_HASH =
   "0xb4367ebc10997be2f01f45b58197b507e9637ee66570eaf9b329cd3455b834cf";
 
 const PROJECT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const LOCAL_STATE_DIR = resolve(PROJECT_DIR, ".launch-local");
-const LOCAL_STATE_FILE = resolve(LOCAL_STATE_DIR, "production-registry.json");
+export const DEPLOYMENT_MANIFEST_FILE = resolve(
+  PROJECT_DIR,
+  "contracts/deployments/robinhood-mainnet.json",
+);
 const RPC_URL = "https://rpc.mainnet.chain.robinhood.com";
 const SITE_URL = "https://degen-pension.vercel.app";
+export const VERCEL_TEAM_SLUG = "dumkeacee149-blips-projects";
 const PONS_FACTORY = "0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB";
 const WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
+const CANONICAL_QQQ = "0xD5f3879160bc7c32ebb4dC785F8a4F505888de68";
 const V3_FACTORY = "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA";
 const PONS_POOL_FEE = 10_000;
-const LOCAL_ADMIN_PORT = 4177;
-const LOCAL_CALLBACK_PORT = 4178;
-const MIN_PREPARE_BALANCE_WEI = 1_000_000_000_000_000n;
-const MIN_LAUNCH_BALANCE_WEI = 600_000_000_000_000n;
+const DEFAULT_PROBE_AMOUNT_WEI = 100_000_000_000_000n;
+const DEFAULT_CANARY_CONFIRMATIONS = 12;
+const DEFAULT_CANARY_MAX_AMOUNT_WEI = 10_000_000_000_000_000n;
+const DEFAULT_CANARY_MAX_CONFIRMATIONS = 10_000;
+const OPERATOR_PROOF_TTL_SECONDS = 5 * 60;
+const OPERATOR_PROOF_FUTURE_SKEW_SECONDS = 15;
+const MAX_RUNTIME_AGE_MS = 90_000;
+const MAX_RUNTIME_VALIDITY_MS = 75_000;
+const REQUIRED_RUNTIME_CHECKS = Object.freeze([
+  "releaseManifest",
+  "rpcChain",
+  "foundationCode",
+  "factoryAuthority",
+  "factoryImplementation",
+  "factoryMarket",
+  "gatewayCode",
+  "gatewayInitialized",
+  "gatewayBindings",
+  "adapterCode",
+  "adapterBindings",
+  "quoterCode",
+  "quoteRoutes",
+  "eligibilityProvider",
+  "eligibilityChecker",
+  "eligibilitySigner",
+  "policyHash",
+  "activatedBlock",
+  "statsIndexer",
+  "distributedRateLimit",
+  "monitoring",
+  "independentAudit",
+  "stockAssetRegistry",
+]);
+export const LEGACY_VERCEL_RUNTIME_KEYS = Object.freeze([
+  "FACTORY_ADDRESS",
+  "GATEWAY_ADDRESS",
+  "OFFICIAL_TOKEN_ADDRESS",
+  "GATEWAY_ACTIVATED_BLOCK",
+]);
+export const AUDIT_VERCEL_RUNTIME_KEYS = Object.freeze([
+  "INDEPENDENT_AUDIT_REPORT_URL",
+  "INDEPENDENT_AUDIT_SHA256",
+  "INDEPENDENT_AUDIT_FIRM",
+  "INDEPENDENT_AUDIT_COMPLETED_AT",
+  "INDEPENDENT_AUDIT_SOURCE_COMMIT",
+]);
+
+const issuedOperatorChallenges = new Map();
+const consumedOperatorProofs = new Set();
+const usedOperatorProofsForGate = new Set();
+const completedOperatorProofsForGate = new Set();
 
 const registryAbi = parseAbi([
   "function operatorAuthorized() view returns (bool)",
@@ -63,6 +119,14 @@ const checkerAbi = parseAbi([
 const implementationAbi = parseAbi([
   "function initialized() view returns (bool)",
   "function paused() view returns (bool)",
+]);
+
+const gatewayAbi = parseAbi([
+  "function buyNative(uint256 minProjectOut,uint256 minStockOut,address recipient,uint256 deadline,uint256 eligibilityDeadline,bytes signature) payable returns (uint256 projectAmountOut,uint256 stockAmountOut)",
+]);
+
+const splitBuyEventAbi = parseAbi([
+  "event SplitBuy(address indexed payer,address indexed recipient,uint256 grossAmountIn,uint256 explicitFeeAmount,uint256 netAmountIn,uint256 projectAmountIn,uint256 stockAmountIn,uint256 projectAmountOut,uint256 stockAmountOut)",
 ]);
 
 const ponsFactoryAbi = [{
@@ -110,10 +174,6 @@ function same(left, right) {
   return Boolean(left && right && isAddressEqual(left, right));
 }
 
-function pause(milliseconds) {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
-}
-
 function run(command, args, options = {}) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(command, args, {
@@ -129,60 +189,499 @@ function run(command, args, options = {}) {
   });
 }
 
-function stateFingerprint(snapshot) {
-  const values = vercelRuntimeValues(snapshot);
-  return createHash("sha256").update(JSON.stringify(values)).digest("hex");
-}
-
-export function vercelRuntimeValues(snapshot) {
-  return Object.freeze({
-    REGISTRY_ADDRESS: snapshot.registryAddress,
-    PROJECT_AUTHORITY_ADDRESS: CONTROL_WALLET,
-    GATEWAY_IMPLEMENTATION_ADDRESS: snapshot.implementationAddress,
-    GATEWAY_IMPLEMENTATION_CODE_HASH: snapshot.implementationCodeHash,
-    ELIGIBILITY_CHECKER_ADDRESS: snapshot.eligibilityCheckerAddress,
-    ELIGIBILITY_POLICY_HASH: snapshot.eligibilityPolicyHash,
+function runCapture(command, args, options = {}) {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(command, args, {
+      cwd: PROJECT_DIR,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: options.env || process.env,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("exit", (code) => resolvePromise({ code, stdout, stderr }));
   });
 }
 
-async function loadLocalState() {
+function requireAddress(value, label) {
+  if (!isAddress(value || "")) throw new Error(`${label} must be a complete address.`);
+  return getAddress(value);
+}
+
+function requireHash(value, label) {
+  if (!/^0x[a-fA-F0-9]{64}$/.test(String(value || ""))) {
+    throw new Error(`${label} must be a 32-byte hex value.`);
+  }
+  return String(value).toLowerCase();
+}
+
+function nullableAddress(value, label) {
+  if (value === null) return null;
+  return requireAddress(value, label);
+}
+
+function requireSha256(value, label) {
+  if (!/^[a-f0-9]{64}$/.test(String(value || ""))) {
+    throw new Error(`${label} must be a lowercase SHA-256 digest.`);
+  }
+  return String(value);
+}
+
+function requireHttpsUrl(value, label) {
   try {
-    const parsed = JSON.parse(await readFile(LOCAL_STATE_FILE, "utf8"));
-    if (parsed?.schemaVersion !== 1 || !isAddress(parsed.registryAddress)) {
-      throw new Error("Local Registry state is malformed.");
-    }
-    return parsed;
-  } catch (error) {
-    if (error?.code === "ENOENT") return null;
-    throw error;
+    const parsed = new URL(String(value || ""));
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.hash) throw new Error();
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    throw new Error(`${label} must be a public HTTPS URL without credentials or a fragment.`);
   }
 }
 
-async function saveLocalState(snapshot, extra = {}) {
-  const state = {
-    schemaVersion: 1,
-    chainId: 4663,
-    ...snapshot,
-    ...extra,
-    savedAt: new Date().toISOString(),
+function manifestIdentity(manifest) {
+  return {
+    schemaVersion: manifest.schemaVersion,
+    manifestId: manifest.manifestId,
+    chainId: manifest.chainId,
+    protocolVersion: manifest.protocolVersion,
+    transactionHash: manifest.transactionHash,
+    registry: manifest.registry,
+    projectAuthority: manifest.projectAuthority,
+    launchOperator: manifest.launchOperator,
+    guardian: manifest.guardian,
+    gatewayImplementation: manifest.gatewayImplementation,
+    gatewayImplementationRuntimeCodeHash: manifest.gatewayImplementationRuntimeCodeHash,
+    eligibilityChecker: manifest.eligibilityChecker,
+    stockAdapter: manifest.stockAdapter,
+    ponsAdapterFactory: manifest.ponsAdapterFactory,
+    currentOfficialToken: manifest.currentOfficialToken,
+    currentMarket: manifest.currentMarket,
+    currentActivatedBlock: manifest.currentActivatedBlock,
+    tradingActive: manifest.tradingActive,
+    independentAudit: manifest.independentAudit,
   };
-  await mkdir(LOCAL_STATE_DIR, { recursive: true, mode: 0o700 });
-  await writeFile(LOCAL_STATE_FILE, `${JSON.stringify(state, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  return state;
 }
 
-async function contractCode(address, label) {
-  const code = await client.getBytecode({ address });
+function validateIndependentAudit(input, manifest) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("Deployment manifest must explicitly record independentAudit evidence.");
+  }
+  if (input.status === "not-ready") {
+    if (
+      input.reportUrl !== null
+      || input.sha256 !== null
+      || input.firm !== null
+      || input.completedAt !== null
+      || input.scope !== null
+    ) {
+      throw new Error("A not-ready independentAudit record must not contain evidence.");
+    }
+    if (manifest.tradingActive === true) {
+      throw new Error("Active deployment manifest requires verified independentAudit evidence and scope.");
+    }
+    return Object.freeze({ ...input });
+  }
+  const scope = input.scope;
+  if (input.status !== "verified" || !scope || typeof scope !== "object" || Array.isArray(scope)) {
+    throw new Error("Deployment manifest independentAudit must be not-ready or verified with scope.");
+  }
+  const completedAt = new Date(input.completedAt || "");
+  if (!Number.isFinite(completedAt.getTime()) || completedAt.getTime() > Date.now()) {
+    throw new Error("Independent audit completion date is invalid or in the future.");
+  }
+  const normalized = {
+    status: "verified",
+    reportUrl: requireHttpsUrl(input.reportUrl, "Independent audit report URL"),
+    sha256: requireSha256(input.sha256, "Independent audit report digest"),
+    firm: String(input.firm || "").trim(),
+    completedAt: completedAt.toISOString(),
+    scope: {
+      manifestId: scope.manifestId,
+      protocolVersion: scope.protocolVersion,
+      registry: requireAddress(scope.registry, "Independent audit scope Registry"),
+      gatewayImplementation: requireAddress(
+        scope.gatewayImplementation,
+        "Independent audit scope Gateway implementation",
+      ),
+      gatewayImplementationRuntimeCodeHash: requireHash(
+        scope.gatewayImplementationRuntimeCodeHash,
+        "Independent audit scope implementation code hash",
+      ),
+      sourceCommit: requireCommit(scope.sourceCommit, "Independent audit source commit"),
+    },
+  };
+  if (normalized.firm.length < 2) throw new Error("Independent audit firm is missing.");
+  if (
+    normalized.scope.manifestId !== manifest.manifestId
+    || normalized.scope.protocolVersion !== manifest.protocolVersion
+    || normalized.scope.registry !== manifest.registry
+    || normalized.scope.gatewayImplementation !== manifest.gatewayImplementation
+    || normalized.scope.gatewayImplementationRuntimeCodeHash
+      !== manifest.gatewayImplementationRuntimeCodeHash
+  ) {
+    throw new Error("Independent audit scope does not match the sole deployment manifest.");
+  }
+  return Object.freeze({ ...normalized, scope: Object.freeze(normalized.scope) });
+}
+
+export function validateDeploymentManifest(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("Deployment manifest must be a JSON object.");
+  }
+  if (input.schemaVersion !== 1) throw new Error("Deployment manifest schemaVersion must be 1.");
+  if (input.manifestId !== "robinhood-mainnet-production-v2") {
+    throw new Error("Deployment manifestId is not the pinned production identifier.");
+  }
+  if (input.chainId !== 4663 || input.protocolVersion !== 2) {
+    throw new Error("Deployment manifest chain or protocol version is invalid.");
+  }
+  if (input.network !== "Robinhood Chain") throw new Error("Deployment manifest network is invalid.");
+  if (input.maxAmountInWei !== "10000000000000000000") {
+    throw new Error("Deployment manifest maximum input is not the fixed 10 ETH limit.");
+  }
+
+  const manifest = {
+    ...input,
+    transactionHash: requireHash(input.transactionHash, "Deployment transaction hash"),
+    registry: requireAddress(input.registry, "Registry"),
+    deployer: requireAddress(input.deployer, "Deployer"),
+    projectAuthority: requireAddress(input.projectAuthority, "Project authority"),
+    launchOperator: requireAddress(input.launchOperator, "Launch operator"),
+    guardian: requireAddress(input.guardian, "Guardian"),
+    eligibilityAuthority: requireAddress(input.eligibilityAuthority, "Eligibility authority"),
+    gatewayImplementation: requireAddress(input.gatewayImplementation, "Gateway implementation"),
+    gatewayImplementationRuntimeCodeHash: requireHash(
+      input.gatewayImplementationRuntimeCodeHash,
+      "Gateway implementation runtime code hash",
+    ),
+    eligibilityChecker: requireAddress(input.eligibilityChecker, "Eligibility checker"),
+    stockAdapter: requireAddress(input.stockAdapter, "Stock adapter"),
+    ponsAdapterFactory: requireAddress(input.ponsAdapterFactory, "Pons adapter factory"),
+    eligibilityPolicyHash: requireHash(input.eligibilityPolicyHash, "Eligibility policy hash"),
+    currentOfficialToken: nullableAddress(input.currentOfficialToken, "Current official token"),
+    currentMarket: nullableAddress(input.currentMarket, "Current market"),
+  };
+
+  if (manifest.projectAuthority !== getAddress(CONTROL_WALLET)) {
+    throw new Error("Deployment manifest project authority does not match the immutable foundation authority.");
+  }
+  if (manifest.eligibilityAuthority !== getAddress(ELIGIBILITY_AUTHORITY)) {
+    throw new Error("Deployment manifest eligibility authority does not match production.");
+  }
+  if (manifest.eligibilityPolicyHash !== ELIGIBILITY_POLICY_HASH) {
+    throw new Error("Deployment manifest eligibility policy hash does not match production.");
+  }
+  if (manifest.operatorAuthorized !== true) {
+    throw new Error("Deployment manifest does not record the one-way operator authorization.");
+  }
+  if (manifest.gatewayImplementationLocked !== true) {
+    throw new Error("Deployment manifest does not attest the locked Gateway implementation.");
+  }
+  if (!Number.isSafeInteger(manifest.currentActivatedBlock) || manifest.currentActivatedBlock < 0) {
+    throw new Error("Deployment manifest currentActivatedBlock is invalid.");
+  }
+  if (manifest.tradingActive === true) {
+    if (!manifest.currentOfficialToken || !manifest.currentMarket || manifest.currentActivatedBlock <= 0) {
+      throw new Error("Active deployment manifest is missing its CA, Gateway or activation block.");
+    }
+  } else if (
+    manifest.tradingActive !== false
+    || manifest.currentOfficialToken !== null
+    || manifest.currentMarket !== null
+    || manifest.currentActivatedBlock !== 0
+  ) {
+    throw new Error("Inactive deployment manifest must not contain an active market binding.");
+  }
+  manifest.independentAudit = validateIndependentAudit(input.independentAudit, manifest);
+  return Object.freeze(manifest);
+}
+
+export async function loadDeploymentManifest() {
+  return validateDeploymentManifest(JSON.parse(await readFile(DEPLOYMENT_MANIFEST_FILE, "utf8")));
+}
+
+export function deploymentManifestDigest(manifest) {
+  return createHash("sha256").update(JSON.stringify(manifestIdentity(manifest))).digest("hex");
+}
+
+function requireCommit(value, label = "Release code commit") {
+  if (!/^[a-fA-F0-9]{40}$/.test(String(value || ""))) {
+    throw new Error(`${label} must be a full 40-character Git commit.`);
+  }
+  return String(value).toLowerCase();
+}
+
+function normalizeOperatorEnvelope(manifest, proof, expectedCodeCommit = null) {
+  if (!proof || typeof proof !== "object" || Array.isArray(proof)) {
+    throw new Error("OPERATOR_PROOF_INVALID · proof envelope is missing.");
+  }
+  const issuedAt = Number(proof.issuedAt);
+  const expiresAt = Number(proof.expiresAt);
+  if (!Number.isSafeInteger(issuedAt) || !Number.isSafeInteger(expiresAt)) {
+    throw new Error("OPERATOR_PROOF_INVALID · issuedAt and expiresAt must be Unix seconds.");
+  }
+  if (expiresAt <= issuedAt || expiresAt - issuedAt > OPERATOR_PROOF_TTL_SECONDS) {
+    throw new Error("OPERATOR_PROOF_INVALID · proof lifetime exceeds the five-minute limit.");
+  }
+  const challenge = requireHash(proof.challenge, "Operator challenge");
+  const codeCommit = requireCommit(proof.codeCommit);
+  const manifestSha256 = deploymentManifestDigest(manifest);
+  if (
+    proof.schemaVersion !== 1
+    || proof.chainId !== manifest.chainId
+    || !same(proof.registryAddress, manifest.registry)
+    || !same(proof.operatorAddress, manifest.launchOperator)
+    || proof.manifestSha256 !== manifestSha256
+    || (expectedCodeCommit && codeCommit !== requireCommit(expectedCodeCommit))
+  ) {
+    throw new Error("OPERATOR_PROOF_BINDING_MISMATCH · proof differs from manifest, chain, Registry, operator or code commit.");
+  }
+  return Object.freeze({
+    schemaVersion: 1,
+    issuedAt,
+    expiresAt,
+    challenge,
+    chainId: manifest.chainId,
+    registryAddress: manifest.registry,
+    operatorAddress: manifest.launchOperator,
+    manifestSha256,
+    codeCommit,
+  });
+}
+
+export function createOperatorControlChallenge(manifest, {
+  codeCommit,
+  nowSeconds = Math.floor(Date.now() / 1_000),
+  ttlSeconds = OPERATOR_PROOF_TTL_SECONDS,
+  randomBytesImpl = randomBytes,
+} = {}) {
+  if (!Number.isSafeInteger(nowSeconds) || nowSeconds <= 0) {
+    throw new Error("Operator proof issue time is invalid.");
+  }
+  if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 30 || ttlSeconds > OPERATOR_PROOF_TTL_SECONDS) {
+    throw new Error("Operator proof TTL must be between 30 and 300 seconds.");
+  }
+  const challenge = `0x${Buffer.from(randomBytesImpl(32)).toString("hex")}`;
+  const proof = normalizeOperatorEnvelope(manifest, {
+    schemaVersion: 1,
+    issuedAt: nowSeconds,
+    expiresAt: nowSeconds + ttlSeconds,
+    challenge,
+    chainId: manifest.chainId,
+    registryAddress: manifest.registry,
+    operatorAddress: manifest.launchOperator,
+    manifestSha256: deploymentManifestDigest(manifest),
+    codeCommit,
+  }, codeCommit);
+  issuedOperatorChallenges.set(proof.challenge, JSON.stringify(proof));
+  return proof;
+}
+
+export function operatorControlMessage(manifest, proof) {
+  const normalized = normalizeOperatorEnvelope(manifest, proof, proof?.codeCommit);
+  return [
+    "DEGEN PENSION LAUNCH OPERATOR CONTROL V2",
+    `issuedAt:${normalized.issuedAt}`,
+    `expiresAt:${normalized.expiresAt}`,
+    `challenge:${normalized.challenge}`,
+    `chainId:${normalized.chainId}`,
+    `registry:${normalized.registryAddress}`,
+    `operator:${normalized.operatorAddress}`,
+    `manifestSha256:${normalized.manifestSha256}`,
+    `codeCommit:${normalized.codeCommit}`,
+  ].join("\n");
+}
+
+export async function auditOperatorControlProof(manifest, proof, {
+  codeCommit = proof?.codeCommit,
+} = {}) {
+  const normalized = normalizeOperatorEnvelope(manifest, proof, codeCommit);
+  if (!/^0x[a-fA-F0-9]{130}$/.test(String(proof.signature || ""))) {
+    throw new Error("OPERATOR_PROOF_INVALID · signature must be 65 bytes.");
+  }
+  const verifiedAt = Number(proof.verifiedAt);
+  if (
+    !Number.isSafeInteger(verifiedAt)
+    || verifiedAt < normalized.issuedAt - OPERATOR_PROOF_FUTURE_SKEW_SECONDS
+    || verifiedAt > normalized.expiresAt
+  ) {
+    throw new Error("OPERATOR_PROOF_TIME_INVALID · artifact was not verified inside its signed time window.");
+  }
+  const recovered = await recoverMessageAddress({
+    message: operatorControlMessage(manifest, normalized),
+    signature: proof.signature,
+  });
+  if (!same(recovered, manifest.launchOperator)) {
+    throw new Error(
+      `OPERATOR_PROOF_MISMATCH · proof recovered ${recovered}; expected ${manifest.launchOperator}.`,
+    );
+  }
+  return Object.freeze({
+    ...normalized,
+    signature: proof.signature,
+    verifiedAt,
+    recoveredOperator: getAddress(recovered),
+  });
+}
+
+function operatorProofIdentifier(proof) {
+  return createHash("sha256")
+    .update(`${proof.challenge}:${String(proof.signature || "").toLowerCase()}`)
+    .digest("hex");
+}
+
+export async function verifyOperatorControl(manifest, {
+  proof,
+  signature,
+  codeCommit = proof?.codeCommit,
+  nowSeconds = Math.floor(Date.now() / 1_000),
+} = {}) {
+  const normalized = normalizeOperatorEnvelope(manifest, proof, codeCommit);
+  const proofId = operatorProofIdentifier({ ...normalized, signature });
+  if (consumedOperatorProofs.has(proofId)) {
+    throw new Error("OPERATOR_PROOF_REPLAYED · this proof was already consumed in the current process.");
+  }
+  const issued = issuedOperatorChallenges.get(normalized.challenge);
+  if (!issued || issued !== JSON.stringify(normalized)) {
+    throw new Error("OPERATOR_CHALLENGE_UNKNOWN · launch must sign the fresh challenge generated by this process.");
+  }
+  if (normalized.issuedAt > nowSeconds + OPERATOR_PROOF_FUTURE_SKEW_SECONDS) {
+    throw new Error("OPERATOR_PROOF_FROM_FUTURE · proof issue time is ahead of the verifier clock.");
+  }
+  if (normalized.expiresAt <= nowSeconds) {
+    throw new Error("OPERATOR_PROOF_EXPIRED · generate and sign a new launch challenge.");
+  }
+  const artifact = await auditOperatorControlProof(manifest, {
+    ...normalized,
+    signature,
+    verifiedAt: nowSeconds,
+  }, { codeCommit });
+  issuedOperatorChallenges.delete(normalized.challenge);
+  consumedOperatorProofs.add(proofId);
+  return artifact;
+}
+
+export function __resetOperatorProofsForTests() {
+  issuedOperatorChallenges.clear();
+  consumedOperatorProofs.clear();
+  usedOperatorProofsForGate.clear();
+  completedOperatorProofsForGate.clear();
+}
+
+export async function readReleaseCodeCommit({ runCaptureImpl = runCapture } = {}) {
+  const revisionBefore = await runCaptureImpl("git", ["rev-parse", "--verify", "HEAD"]);
+  if (revisionBefore.code !== 0) throw new Error("RELEASE_COMMIT_UNAVAILABLE · cannot resolve Git HEAD.");
+  const status = await runCaptureImpl("git", ["status", "--porcelain", "--untracked-files=normal"]);
+  if (status.code !== 0) throw new Error("RELEASE_WORKTREE_UNKNOWN · cannot verify Git worktree state.");
+  if (status.stdout.trim()) {
+    throw new Error("RELEASE_WORKTREE_DIRTY · commit every production change before generating operator proof.");
+  }
+  const revisionAfter = await runCaptureImpl("git", ["rev-parse", "--verify", "HEAD"]);
+  if (revisionAfter.code !== 0) throw new Error("RELEASE_COMMIT_UNAVAILABLE · cannot re-resolve Git HEAD.");
+  const before = requireCommit(revisionBefore.stdout.trim());
+  const after = requireCommit(revisionAfter.stdout.trim());
+  if (after !== before) {
+    throw new Error("RELEASE_COMMIT_CHANGED · Git HEAD changed during the clean-worktree check.");
+  }
+  return after;
+}
+
+export async function assertReleaseCommitUnchanged(expectedCodeCommit, {
+  codeCommitLoader = readReleaseCodeCommit,
+} = {}) {
+  const expected = requireCommit(expectedCodeCommit);
+  const current = requireCommit(await codeCommitLoader());
+  if (current !== expected) {
+    throw new Error(
+      `RELEASE_COMMIT_CHANGED · current clean commit ${current} differs from signed commit ${expected}.`,
+    );
+  }
+  return current;
+}
+
+async function collectFreshOperatorProof(manifest, {
+  signatureProvider,
+  codeCommitLoader = readReleaseCodeCommit,
+} = {}) {
+  if (typeof signatureProvider !== "function") {
+    throw new Error("OPERATOR_CONTROL_UNPROVEN · no interactive signature provider is available.");
+  }
+  const codeCommit = await codeCommitLoader();
+  const proof = createOperatorControlChallenge(manifest, { codeCommit });
+  const message = operatorControlMessage(manifest, proof);
+  console.log("\nFRESH OPERATOR CONTROL CHALLENGE · expires in five minutes");
+  console.log(JSON.stringify(proof, null, 2));
+  console.log("\nSign this exact personal_sign message with the manifest launch operator:\n");
+  console.log(message);
+  const signature = String(await signatureProvider({ proof, message })).trim();
+  await assertReleaseCommitUnchanged(codeCommit, { codeCommitLoader });
+  return verifyOperatorControl(manifest, { proof, signature, codeCommit });
+}
+
+export function assertRegistrySnapshotMatchesManifest(snapshot, manifest) {
+  const comparisons = [
+    ["launchOperator", snapshot.launchOperator, manifest.launchOperator],
+    ["projectAuthority", snapshot.projectAuthority, manifest.projectAuthority],
+    ["guardian", snapshot.guardian, manifest.guardian],
+    ["implementation", snapshot.implementationAddress, manifest.gatewayImplementation],
+    ["eligibilityChecker", snapshot.eligibilityCheckerAddress, manifest.eligibilityChecker],
+    ["stockAdapter", snapshot.stockAdapterAddress, manifest.stockAdapter],
+    ["ponsAdapterFactory", snapshot.ponsAdapterFactoryAddress, manifest.ponsAdapterFactory],
+    ["eligibilityAuthority", snapshot.eligibilityAuthority, manifest.eligibilityAuthority],
+    ["policyAdmin", snapshot.policyAdmin, manifest.projectAuthority],
+  ];
+  for (const [label, actual, expected] of comparisons) {
+    if (!same(actual, expected)) {
+      throw new Error(`DEPLOYMENT_MANIFEST_MISMATCH · ${label} is ${actual}; manifest requires ${expected}.`);
+    }
+  }
+  if (snapshot.implementationCodeHash?.toLowerCase() !== manifest.gatewayImplementationRuntimeCodeHash) {
+    throw new Error("DEPLOYMENT_MANIFEST_MISMATCH · Gateway implementation code hash changed.");
+  }
+  if (snapshot.eligibilityPolicyHash?.toLowerCase() !== manifest.eligibilityPolicyHash) {
+    throw new Error("DEPLOYMENT_MANIFEST_MISMATCH · eligibility policy hash changed.");
+  }
+  if (snapshot.maxAmountIn !== BigInt(manifest.maxAmountInWei)) {
+    throw new Error("DEPLOYMENT_MANIFEST_MISMATCH · maximum input changed.");
+  }
+  if (snapshot.operatorAuthorized !== manifest.operatorAuthorized) {
+    throw new Error("DEPLOYMENT_MANIFEST_MISMATCH · operator authorization state changed.");
+  }
+  if (snapshot.implementationInitialized !== true || snapshot.implementationPaused !== true) {
+    throw new Error("DEPLOYMENT_MANIFEST_MISMATCH · Gateway implementation is not initialized and paused.");
+  }
+
+  if (manifest.tradingActive) {
+    if (
+      !snapshot.marketReady
+      || !same(snapshot.currentOfficialToken, manifest.currentOfficialToken)
+      || !same(snapshot.currentMarket, manifest.currentMarket)
+      || snapshot.activatedBlock !== manifest.currentActivatedBlock
+    ) {
+      throw new Error("DEPLOYMENT_MANIFEST_MISMATCH · active market binding differs from the manifest.");
+    }
+  } else if (
+    snapshot.marketReady
+    || snapshot.currentOfficialToken
+    || snapshot.currentMarket
+    || snapshot.activatedBlock !== 0
+  ) {
+    throw new Error(
+      "DEPLOYMENT_MANIFEST_STALE · onchain market state changed; update and review the sole manifest before release.",
+    );
+  }
+  return snapshot;
+}
+
+async function contractCode(publicClient, address, label) {
+  const code = await publicClient.getBytecode({ address });
   if (!code || code === "0x") throw new Error(`${label} has no contract code.`);
   return code;
 }
 
-export async function readAndValidateRegistry(registryAddress) {
-  const normalizedRegistry = getAddress(registryAddress);
-  await contractCode(normalizedRegistry, "Registry");
+export async function readAndValidateRegistry(manifest, publicClient = client) {
+  await contractCode(publicClient, manifest.registry, "Registry");
   const [
     operatorAuthorized,
     launchOperator,
@@ -193,36 +692,31 @@ export async function readAndValidateRegistry(registryAddress) {
     stockAdapterAddress,
     ponsAdapterFactoryAddress,
     maxAmountIn,
-    currentMarket,
-    currentOfficialToken,
-    activatedBlock,
+    currentMarketRaw,
+    currentOfficialTokenRaw,
+    activatedBlockRaw,
     marketReady,
   ] = await Promise.all([
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "operatorAuthorized" }),
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "launchOperator" }),
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "projectAuthority" }),
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "guardian" }),
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "implementation" }),
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "eligibilityChecker" }),
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "stockAdapter" }),
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "ponsAdapterFactory" }),
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "maxAmountIn" }),
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "currentMarket" }),
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "currentOfficialToken" }),
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "currentActivatedBlock" }),
-    client.readContract({ address: normalizedRegistry, abi: registryAbi, functionName: "marketReady" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "operatorAuthorized" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "launchOperator" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "projectAuthority" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "guardian" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "implementation" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "eligibilityChecker" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "stockAdapter" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "ponsAdapterFactory" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "maxAmountIn" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "currentMarket" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "currentOfficialToken" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "currentActivatedBlock" }),
+    publicClient.readContract({ address: manifest.registry, abi: registryAbi, functionName: "marketReady" }),
   ]);
 
-  if (!same(launchOperator, CONTROL_WALLET)) throw new Error("Registry launch operator is not the replacement wallet.");
-  if (!same(projectAuthority, CONTROL_WALLET)) throw new Error("Registry project authority is not the replacement wallet.");
-  if (!same(guardian, CONTROL_WALLET)) throw new Error("Registry guardian is not the replacement wallet.");
-  if (maxAmountIn !== 10n * 10n ** 18n) throw new Error("Registry maximum input is not the fixed 10 ETH limit.");
-
-  const [implementationCode] = await Promise.all([
-    contractCode(implementationAddress, "Gateway implementation"),
-    contractCode(eligibilityCheckerAddress, "Eligibility checker"),
-    contractCode(stockAdapterAddress, "QQQ adapter"),
-    contractCode(ponsAdapterFactoryAddress, "Pons adapter factory"),
+  const implementationCode = await contractCode(publicClient, implementationAddress, "Gateway implementation");
+  await Promise.all([
+    contractCode(publicClient, eligibilityCheckerAddress, "Eligibility checker"),
+    contractCode(publicClient, stockAdapterAddress, "QQQ adapter"),
+    contractCode(publicClient, ponsAdapterFactoryAddress, "Pons adapter factory"),
   ]);
   const [
     implementationInitialized,
@@ -231,219 +725,71 @@ export async function readAndValidateRegistry(registryAddress) {
     policyAdmin,
     eligibilityPolicyHash,
   ] = await Promise.all([
-    client.readContract({ address: implementationAddress, abi: implementationAbi, functionName: "initialized" }),
-    client.readContract({ address: implementationAddress, abi: implementationAbi, functionName: "paused" }),
-    client.readContract({ address: eligibilityCheckerAddress, abi: checkerAbi, functionName: "eligibilityAuthority" }),
-    client.readContract({ address: eligibilityCheckerAddress, abi: checkerAbi, functionName: "policyAdmin" }),
-    client.readContract({ address: eligibilityCheckerAddress, abi: checkerAbi, functionName: "policyHash" }),
+    publicClient.readContract({ address: implementationAddress, abi: implementationAbi, functionName: "initialized" }),
+    publicClient.readContract({ address: implementationAddress, abi: implementationAbi, functionName: "paused" }),
+    publicClient.readContract({ address: eligibilityCheckerAddress, abi: checkerAbi, functionName: "eligibilityAuthority" }),
+    publicClient.readContract({ address: eligibilityCheckerAddress, abi: checkerAbi, functionName: "policyAdmin" }),
+    publicClient.readContract({ address: eligibilityCheckerAddress, abi: checkerAbi, functionName: "policyHash" }),
   ]);
-  if (implementationInitialized !== true || implementationPaused !== true) {
-    throw new Error("Gateway implementation is not permanently initialized and paused.");
-  }
-  if (!same(eligibilityAuthority, ELIGIBILITY_AUTHORITY)) {
-    throw new Error("Eligibility signer does not match the production service.");
-  }
-  if (!same(policyAdmin, CONTROL_WALLET)) throw new Error("Eligibility policy admin is not the replacement wallet.");
-  if (eligibilityPolicyHash.toLowerCase() !== ELIGIBILITY_POLICY_HASH) {
-    throw new Error("Eligibility policy hash does not match production.");
-  }
 
-  return {
-    registryAddress: normalizedRegistry,
+  const snapshot = {
+    registryAddress: manifest.registry,
     launchOperator: getAddress(launchOperator),
     projectAuthority: getAddress(projectAuthority),
     guardian: getAddress(guardian),
     implementationAddress: getAddress(implementationAddress),
     implementationCodeHash: keccak256(implementationCode),
+    implementationInitialized,
+    implementationPaused,
     eligibilityCheckerAddress: getAddress(eligibilityCheckerAddress),
+    eligibilityAuthority: getAddress(eligibilityAuthority),
     eligibilityPolicyHash: eligibilityPolicyHash.toLowerCase(),
+    policyAdmin: getAddress(policyAdmin),
     stockAdapterAddress: getAddress(stockAdapterAddress),
     ponsAdapterFactoryAddress: getAddress(ponsAdapterFactoryAddress),
+    maxAmountIn,
     operatorAuthorized,
-    currentMarket: same(currentMarket, zeroAddress) ? null : getAddress(currentMarket),
-    currentOfficialToken: same(currentOfficialToken, zeroAddress) ? null : getAddress(currentOfficialToken),
-    activatedBlock: Number(activatedBlock),
+    currentMarket: same(currentMarketRaw, zeroAddress) ? null : getAddress(currentMarketRaw),
+    currentOfficialToken: same(currentOfficialTokenRaw, zeroAddress) ? null : getAddress(currentOfficialTokenRaw),
+    activatedBlock: Number(activatedBlockRaw),
     marketReady,
   };
+  return assertRegistrySnapshotMatchesManifest(snapshot, manifest);
 }
 
-async function controlBalance() {
-  return client.getBalance({ address: CONTROL_WALLET });
-}
-
-async function requireControlBalance(minimumWei, label) {
-  const balance = await controlBalance();
-  console.log(`CONTROL WALLET GAS: ${formatEther(balance)} ETH`);
-  if (balance < minimumWei) {
-    throw new Error(
-      `${label} needs more gas. Top up ${CONTROL_WALLET} to at least 0.005 ETH before continuing.`,
-    );
-  }
-}
-
-export function createLocalControlServer(token) {
-  const events = new Map();
-  const waiters = new Map();
-  const allowedEvents = new Set(["registry", "authorized", "activated"]);
-  const emit = (event, payload) => {
-    events.set(event, payload);
-    const pending = waiters.get(event) || [];
-    waiters.delete(event);
-    for (const resolvePromise of pending) resolvePromise(payload);
-  };
-  const server = createServer(async (request, response) => {
-    const origin = String(request.headers.origin || "");
-    const allowedOrigin = `http://127.0.0.1:${LOCAL_ADMIN_PORT}`;
-    response.setHeader("access-control-allow-origin", allowedOrigin);
-    response.setHeader("access-control-allow-methods", "POST, OPTIONS");
-    response.setHeader("access-control-allow-headers", "content-type");
-    response.setHeader("access-control-allow-private-network", "true");
-    response.setHeader("vary", "Origin");
-    if (request.method === "OPTIONS") {
-      response.statusCode = origin === allowedOrigin ? 204 : 403;
-      return response.end();
-    }
-    const url = new URL(request.url || "/", `http://127.0.0.1:${LOCAL_CALLBACK_PORT}`);
-    if (
-      request.method !== "POST"
-      || url.pathname !== "/state"
-      || url.searchParams.get("token") !== token
-      || origin !== allowedOrigin
-    ) {
-      response.statusCode = 403;
-      return response.end();
-    }
-    let raw = "";
-    for await (const chunk of request) {
-      raw += chunk;
-      if (Buffer.byteLength(raw) > 8_192) {
-        response.statusCode = 413;
-        return response.end();
-      }
-    }
-    try {
-      const body = JSON.parse(raw);
-      if (!allowedEvents.has(body?.event) || !body.payload || typeof body.payload !== "object") {
-        throw new Error("Invalid local event.");
-      }
-      emit(body.event, body.payload);
-      response.statusCode = 204;
-      return response.end();
-    } catch {
-      response.statusCode = 400;
-      return response.end();
-    }
+export function vercelRuntimeValues(snapshot, manifest = null) {
+  const audit = manifest?.independentAudit;
+  return Object.freeze({
+    REGISTRY_ADDRESS: snapshot.registryAddress,
+    PROJECT_AUTHORITY_ADDRESS: snapshot.projectAuthority,
+    GATEWAY_IMPLEMENTATION_ADDRESS: snapshot.implementationAddress,
+    GATEWAY_IMPLEMENTATION_CODE_HASH: snapshot.implementationCodeHash,
+    ELIGIBILITY_CHECKER_ADDRESS: snapshot.eligibilityCheckerAddress,
+    ELIGIBILITY_POLICY_HASH: snapshot.eligibilityPolicyHash,
+    ELIGIBILITY_PROVIDER_MODE: "external",
+    ALLOW_BOUNDED_STATS_FALLBACK: "false",
+    ...(audit?.status === "verified" ? {
+      INDEPENDENT_AUDIT_REPORT_URL: audit.reportUrl,
+      INDEPENDENT_AUDIT_SHA256: audit.sha256,
+      INDEPENDENT_AUDIT_FIRM: audit.firm,
+      INDEPENDENT_AUDIT_COMPLETED_AT: audit.completedAt,
+      INDEPENDENT_AUDIT_SOURCE_COMMIT: audit.scope.sourceCommit,
+    } : {}),
   });
-
-  const listen = () => new Promise((resolvePromise, reject) => {
-    server.once("error", reject);
-    server.listen(LOCAL_CALLBACK_PORT, "127.0.0.1", () => {
-      server.removeListener("error", reject);
-      resolvePromise();
-    });
-  });
-  const waitFor = (event, timeoutMs = 20 * 60_000) => {
-    if (events.has(event)) return Promise.resolve(events.get(event));
-    return new Promise((resolvePromise, reject) => {
-      const timeout = setTimeout(() => {
-        const pending = waiters.get(event) || [];
-        waiters.set(event, pending.filter((candidate) => candidate !== onEvent));
-        reject(new Error(`Timed out waiting for local ${event} confirmation.`));
-      }, timeoutMs);
-      const onEvent = (payload) => {
-        clearTimeout(timeout);
-        resolvePromise(payload);
-      };
-      waiters.set(event, [...(waiters.get(event) || []), onEvent]);
-    });
-  };
-  const close = () => new Promise((resolvePromise) => {
-    server.closeAllConnections?.();
-    server.close(() => resolvePromise());
-  });
-  return { listen, waitFor, close };
 }
 
-async function startLocalAdmin({ registryAddress = "", officialToken = "" } = {}) {
-  const token = randomBytes(24).toString("hex");
-  const control = createLocalControlServer(token);
-  await control.listen();
-  const vite = spawn("npx", [
-    "vite",
-    "--host", "127.0.0.1",
-    "--port", String(LOCAL_ADMIN_PORT),
-    "--strictPort",
-  ], {
-    cwd: PROJECT_DIR,
-    stdio: "ignore",
-    env: { ...process.env, VITE_ENABLE_LOCAL_DEPLOY_PAGE: "true" },
-  });
-  let earlyExit = null;
-  vite.once("exit", (code) => { earlyExit = code; });
-  try {
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      if (earlyExit !== null) throw new Error(`Local admin page failed to start (${earlyExit}).`);
-      try {
-        const response = await fetch(`http://127.0.0.1:${LOCAL_ADMIN_PORT}/deploy`, {
-          signal: AbortSignal.timeout(1_000),
-        });
-        if (response.ok) {
-          const query = new URLSearchParams({
-            adminToken: token,
-            callbackPort: String(LOCAL_CALLBACK_PORT),
-          });
-          if (registryAddress) query.set("registry", registryAddress);
-          if (officialToken) query.set("ca", officialToken);
-          return {
-            vite,
-            control,
-            url: `http://127.0.0.1:${LOCAL_ADMIN_PORT}/deploy?${query}`,
-          };
-        }
-      } catch {
-        // Vite is still starting.
-      }
-      await pause(250);
-    }
-    throw new Error("Local admin page did not become ready within 10 seconds.");
-  } catch (error) {
-    vite.kill("SIGTERM");
-    await control.close();
-    throw error;
-  }
-}
-
-async function closeLocalAdmin(admin) {
-  if (!admin) return;
-  admin.vite.kill("SIGTERM");
-  await admin.control.close();
-}
-
-async function waitForAuthorization(registryAddress, timeoutMs = 20 * 60_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const authorized = await client.readContract({
-      address: registryAddress,
-      abi: registryAbi,
-      functionName: "operatorAuthorized",
-    });
-    if (authorized === true) return;
-    process.stdout.write(".");
-    await pause(2_500);
-  }
-  throw new Error("Timed out waiting for operator authorization.");
-}
-
-async function syncVercelRuntime(snapshot, savedState = {}) {
-  const fingerprint = stateFingerprint(snapshot);
-  if (savedState.vercelRuntimeFingerprint === fingerprint) {
-    console.log("PASS · Vercel Registry bindings are already synchronized.");
-    return savedState;
-  }
-  console.log("\nSynchronizing private Vercel runtime bindings:");
-  for (const [name, value] of Object.entries(vercelRuntimeValues(snapshot))) {
-    console.log(`  ${name}`);
-    await run("npx", [
+export function vercelRuntimeSyncCommands(snapshot, manifest = null) {
+  const remove = [...LEGACY_VERCEL_RUNTIME_KEYS, ...AUDIT_VERCEL_RUNTIME_KEYS]
+    .map((name) => Object.freeze({
+    action: "remove",
+    name,
+    args: ["vercel", "env", "rm", name, "production", "--yes"],
+    }));
+  const add = Object.entries(vercelRuntimeValues(snapshot, manifest)).map(([name, value]) => Object.freeze({
+    action: "add",
+    name,
+    value,
+    args: [
       "vercel",
       "env",
       "add",
@@ -453,63 +799,154 @@ async function syncVercelRuntime(snapshot, savedState = {}) {
       value,
       "--force",
       "--yes",
-    ]);
+    ],
+  }));
+  return Object.freeze([...remove, ...add]);
+}
+
+async function removeLegacyVercelRuntime(command) {
+  const result = await runCapture("npx", command.args);
+  if (result.code === 0) return;
+  const output = `${result.stdout}\n${result.stderr}`;
+  if (/not found|does not exist|no environment variable|could not find/i.test(output)) return;
+  throw new Error(`Failed to remove stale Vercel Production variable ${command.name}.`);
+}
+
+async function syncVercelRuntime(snapshot, manifest) {
+  const commands = vercelRuntimeSyncCommands(snapshot, manifest);
+  console.log("\nRemoving stale direct-address and audit-evidence Vercel Production bindings:");
+  for (const command of commands.filter(({ action }) => action === "remove")) {
+    console.log(`  REMOVE ${command.name}`);
+    await removeLegacyVercelRuntime(command);
   }
-  return saveLocalState(snapshot, { vercelRuntimeFingerprint: fingerprint });
+  console.log("Synchronizing pinned V2 bindings and non-secret fail-closed policy:");
+  for (const command of commands.filter(({ action }) => action === "add")) {
+    console.log(`  ADD ${command.name}`);
+    await run("npx", command.args);
+  }
 }
 
-async function deployProductionSite() {
-  await run("npx", ["vercel", "deploy", "--prod", "--yes"]);
+export function vercelCandidateDeployCommand() {
+  return Object.freeze({
+    command: "npx",
+    args: Object.freeze(["vercel", "deploy", "--prod", "--skip-domain", "--yes"]),
+  });
 }
 
-async function prepareProduction() {
-  console.log("\nPREPARE MODE · NEW PRIVATE CONTROL STACK\n");
-  await requireControlBalance(MIN_PREPARE_BALANCE_WEI, "Registry deployment and authorization");
-  let savedState = await loadLocalState();
-  let snapshot = null;
-  if (savedState) snapshot = await readAndValidateRegistry(savedState.registryAddress);
-
-  if (!snapshot || !snapshot.operatorAuthorized) {
-    const admin = await startLocalAdmin({ registryAddress: snapshot?.registryAddress || "" });
+function requireCandidateDeploymentUrl(value) {
+  const raw = String(value || "").replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, " ");
+  const urlPattern = "https:\\/\\/[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\\.vercel\\.app(?:\\/[^\\s\\\"]*)?";
+  const explicitMatches = [
+    ...raw.matchAll(new RegExp(`(?:^|\\n)Production:\\s*(${urlPattern})`, "g")),
+    ...raw.matchAll(new RegExp(`"deployment"\\s*:\\s*\\{[\\s\\S]*?"url"\\s*:\\s*"(${urlPattern})"`, "g")),
+  ].map((match) => match[1]);
+  const matches = explicitMatches.length > 0
+    ? explicitMatches
+    : raw.match(new RegExp(urlPattern, "g")) || [];
+  const origins = new Set();
+  for (const match of matches) {
+    let candidate;
     try {
-      console.log("Opening the private local management page.");
-      console.log(`Use the selected wallet ${CONTROL_WALLET}.`);
-      await run("/usr/bin/open", [admin.url]);
-      if (!snapshot) {
-        console.log("Confirm DEPLOY FIXED STACK in MetaMask.");
-        const event = await admin.control.waitFor("registry");
-        if (!isAddress(event?.registryAddress)) throw new Error("Local page returned an invalid Registry address.");
-        snapshot = await readAndValidateRegistry(event.registryAddress);
-        savedState = await saveLocalState(snapshot);
-        console.log(`PASS · New Registry captured: ${snapshot.registryAddress}`);
-      }
-      if (!snapshot.operatorAuthorized) {
-        console.log("Confirm AUTHORIZE OPERATOR in MetaMask.");
-        await waitForAuthorization(snapshot.registryAddress);
-        snapshot = await readAndValidateRegistry(snapshot.registryAddress);
-        if (!snapshot.operatorAuthorized) throw new Error("Operator authorization did not persist onchain.");
-        savedState = await saveLocalState(snapshot);
-        console.log("PASS · One-way launch authorization confirmed.");
-      }
-    } finally {
-      await closeLocalAdmin(admin);
+      candidate = new URL(match);
+    } catch {
+      continue;
     }
-  } else {
-    console.log(`PASS · Existing private Registry is authorized: ${snapshot.registryAddress}`);
+    if (
+      candidate.protocol === "https:"
+      && candidate.hostname.endsWith(".vercel.app")
+      && !candidate.username
+      && !candidate.password
+      && !candidate.search
+      && !candidate.hash
+    ) {
+      origins.add(candidate.origin);
+    }
   }
-
-  savedState = await syncVercelRuntime(snapshot, savedState || {});
-  console.log("\nDeploying the Registry-aware public site to Vercel.");
-  await deployProductionSite();
-  console.log("PASS · Public site is prepared. Buying remains fail-closed until the official CA is activated.");
-  await run("/usr/bin/open", [SITE_URL]);
-  return savedState;
+  if (origins.size === 0) {
+    throw new Error("CANDIDATE_DEPLOY_INVALID · Vercel did not return a deployment URL.");
+  }
+  if (origins.size !== 1) {
+    throw new Error("CANDIDATE_DEPLOY_INVALID · Vercel returned multiple deployment URLs.");
+  }
+  return [...origins][0];
 }
 
-async function preflight(ca, snapshot) {
-  const chainId = await client.getChainId();
-  if (chainId !== 4663) throw new Error(`RPC returned unexpected chain ${chainId}.`);
-  await contractCode(ca, "Official CA");
+export function vercelPromoteCommand(candidateUrl) {
+  const url = requireCandidateDeploymentUrl(candidateUrl);
+  return Object.freeze({
+    command: "npx",
+    args: Object.freeze(["vercel", "promote", url, "--yes", "--scope", VERCEL_TEAM_SLUG]),
+  });
+}
+
+export async function deployProductionCandidateAtCommit(expectedCodeCommit, {
+  codeCommitLoader = readReleaseCodeCommit,
+  runCaptureImpl = runCapture,
+} = {}) {
+  const codeCommit = await assertReleaseCommitUnchanged(expectedCodeCommit, { codeCommitLoader });
+  const command = vercelCandidateDeployCommand();
+  const result = await runCaptureImpl(command.command, [...command.args]);
+  if (result.code !== 0) {
+    throw new Error("CANDIDATE_DEPLOY_FAILED · staged Production deployment failed without changing aliases.");
+  }
+  return Object.freeze({
+    codeCommit,
+    candidateUrl: requireCandidateDeploymentUrl(`${result.stdout}\n${result.stderr}`),
+  });
+}
+
+export async function promoteProductionCandidateAtCommit(candidateUrl, expectedCodeCommit, {
+  codeCommitLoader = readReleaseCodeCommit,
+  runImpl = run,
+} = {}) {
+  const codeCommit = await assertReleaseCommitUnchanged(expectedCodeCommit, { codeCommitLoader });
+  const command = vercelPromoteCommand(candidateUrl);
+  await runImpl(command.command, [...command.args]);
+  return Object.freeze({ codeCommit, candidateUrl: requireCandidateDeploymentUrl(candidateUrl) });
+}
+
+export function assertInactivePrepareState(manifest, snapshot) {
+  if (
+    manifest?.tradingActive !== false
+    || manifest?.currentOfficialToken !== null
+    || manifest?.currentMarket !== null
+    || manifest?.currentActivatedBlock !== 0
+    || snapshot?.marketReady !== false
+    || snapshot?.currentOfficialToken !== null
+    || snapshot?.currentMarket !== null
+    || snapshot?.activatedBlock !== 0
+  ) {
+    throw new Error(
+      "PREPARE_ACTIVE_MARKET_FORBIDDEN · --prepare may deploy only an explicitly inactive manifest and Registry snapshot.",
+    );
+  }
+  return true;
+}
+
+export async function prepareInactiveProductionSite({
+  manifest,
+  snapshot,
+  codeCommit,
+  codeCommitLoader = readReleaseCodeCommit,
+  syncImpl = syncVercelRuntime,
+  candidateDeployImpl = deployProductionCandidateAtCommit,
+  promoteImpl = promoteProductionCandidateAtCommit,
+}) {
+  assertInactivePrepareState(manifest, snapshot);
+  await syncImpl(snapshot, manifest);
+  const candidate = await candidateDeployImpl(codeCommit, { codeCommitLoader });
+  await promoteImpl(candidate.candidateUrl, codeCommit, { codeCommitLoader });
+  return Object.freeze({
+    status: "PREPARED",
+    codeCommit: requireCommit(codeCommit),
+    candidateUrl: candidate.candidateUrl,
+  });
+}
+
+async function preflight(ca, snapshot, manifest, publicClient = client) {
+  const chainId = await publicClient.getChainId();
+  if (chainId !== manifest.chainId) throw new Error(`RPC returned unexpected chain ${chainId}.`);
+  await contractCode(publicClient, ca, "Official CA");
   if (!snapshot.operatorAuthorized) throw new Error("Launch operator is not authorized.");
   if (snapshot.currentMarket) {
     if (same(snapshot.currentOfficialToken, ca) && snapshot.marketReady) {
@@ -518,7 +955,7 @@ async function preflight(ca, snapshot) {
     throw new Error(`Registry already has another active CA: ${snapshot.currentOfficialToken}`);
   }
 
-  const launched = await client.readContract({
+  const launched = await publicClient.readContract({
     address: PONS_FACTORY,
     abi: ponsFactoryAbi,
     functionName: "getLaunchedToken",
@@ -535,197 +972,778 @@ async function preflight(ca, snapshot) {
   }
 
   const [canonicalPool, tokenPool] = await Promise.all([
-    client.readContract({
+    publicClient.readContract({
       address: V3_FACTORY,
       abi: v3FactoryAbi,
       functionName: "getPool",
       args: [WETH, ca, PONS_POOL_FEE],
     }),
-    client.readContract({ address: ca, abi: tokenAbi, functionName: "liquidityPool" }),
+    publicClient.readContract({ address: ca, abi: tokenAbi, functionName: "liquidityPool" }),
   ]);
   if (same(canonicalPool, zeroAddress)) throw new Error("Canonical Pons liquidity pool has not been created yet.");
   if (!same(canonicalPool, tokenPool)) {
     throw new Error(`Token pool ${tokenPool} does not match canonical pool ${canonicalPool}.`);
   }
-  await contractCode(canonicalPool, "Canonical Pons pool");
-
-  await client.simulateContract({
+  await contractCode(publicClient, canonicalPool, "Canonical Pons pool");
+  await publicClient.simulateContract({
     address: snapshot.registryAddress,
     abi: registryAbi,
     functionName: "activatePonsMarket",
     args: [ca],
-    account: CONTROL_WALLET,
+    account: manifest.launchOperator,
   });
   return { alreadyLive: false, canonicalPool };
 }
 
-async function waitForActivation(registryAddress, ca, timeoutMs = 15 * 60_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const snapshot = await readAndValidateRegistry(registryAddress);
-    if (
-      same(snapshot.currentOfficialToken, ca)
-      && snapshot.currentMarket
-      && snapshot.marketReady
-      && snapshot.activatedBlock > 0
-    ) return snapshot;
-    process.stdout.write(".");
-    await pause(2_500);
-  }
-  throw new Error("Timed out waiting for the activation transaction.");
-}
-
-async function verifyPublicRuntime(ca) {
-  for (let attempt = 1; attempt <= 12; attempt += 1) {
-    try {
-      const response = await fetch(`${SITE_URL}/api/runtime?launch=${Date.now()}`, {
-        headers: { accept: "application/json" },
-        signal: AbortSignal.timeout(20_000),
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const payload = await response.json();
-      if (!same(payload.officialTokenAddress, ca)) {
-        throw new Error("Runtime CA does not match the activated CA.");
-      }
-      return payload;
-    } catch (error) {
-      if (attempt === 12) throw error;
-      await pause(5_000);
-    }
-  }
-  return null;
-}
-
-async function launchOfficialCa(ca, { preflightOnly = false } = {}) {
-  const savedState = await loadLocalState();
-  if (!savedState) throw new Error("No replacement Registry is prepared. Run the desktop script once in PREPARE mode first.");
-  let snapshot = await readAndValidateRegistry(savedState.registryAddress);
-  if (!snapshot.operatorAuthorized) throw new Error("Replacement Registry is not pre-authorized.");
-  await requireControlBalance(MIN_LAUNCH_BALANCE_WEI, "Official CA activation");
-
-  console.log(`\n[1/5] Preflight ${ca}`);
-  const checked = await preflight(ca, snapshot);
-  console.log("PASS · Official Pons token, WETH pair, 1% pool and activation simulation verified.");
-  if (preflightOnly) {
-    console.log("\nDONE · Preflight-only mode stopped before opening a wallet or sending a transaction.\n");
-    return;
-  }
-
-  if (!checked.alreadyLive) {
-    const admin = await startLocalAdmin({
-      registryAddress: snapshot.registryAddress,
-      officialToken: ca,
-    });
-    try {
-      console.log("\n[2/5] Opening the private local activation page.");
-      console.log(`Confirm ACTIVATE 99/1 with ${CONTROL_WALLET} in MetaMask.`);
-      await run("/usr/bin/open", [admin.url]);
-      process.stdout.write("Waiting for the onchain activation");
-      snapshot = await waitForActivation(snapshot.registryAddress, ca);
-      console.log("\nPASS · Gateway and Pons Adapter activated atomically.");
-    } finally {
-      await closeLocalAdmin(admin);
-    }
-  } else {
-    console.log("\n[2/5] This CA is already active; skipping the activation transaction.");
-    snapshot = await readAndValidateRegistry(snapshot.registryAddress);
-  }
-
-  let nextState = await saveLocalState(snapshot, {
-    vercelRuntimeFingerprint: savedState.vercelRuntimeFingerprint || "",
-  });
-  console.log("\n[3/5] Confirming Vercel Registry bindings and deploying Production.");
-  nextState = await syncVercelRuntime(snapshot, nextState);
-  await deployProductionSite();
-  console.log("PASS · Vercel production deployment completed.");
-
-  console.log("\n[4/5] Verifying the public runtime and homepage CA.");
+async function requestJson(url, options = {}, fetchImpl = fetch) {
+  let response;
   try {
-    const runtime = await verifyPublicRuntime(ca);
-    console.log(`PASS · Runtime status ${runtime.status}; homepage CA is ${runtime.officialTokenAddress}.`);
-    if (runtime.ready !== true) {
-      console.log("NOTICE · CA is public, but buying remains fail-closed until every runtime check passes.");
-    }
+    response = await fetchImpl(url, {
+      ...options,
+      headers: {
+        accept: "application/json",
+        ...(options.body ? { "content-type": "application/json" } : {}),
+        ...(options.headers || {}),
+      },
+      signal: options.signal || AbortSignal.timeout(20_000),
+    });
   } catch (error) {
-    console.log(`NOTICE · Vercel deployed, but Runtime verification could not complete: ${error.message}`);
-    console.log("The browser will open the homepage for a direct check.");
+    throw new Error(`Production API request failed: ${error.message}`);
   }
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`Production API returned invalid JSON (HTTP ${response.status}).`);
+  }
+  if (!response.ok) {
+    const code = payload?.error?.code || payload?.reason || "HTTP_ERROR";
+    throw new Error(`Production API rejected the gate (${response.status} ${code}).`);
+  }
+  return payload;
+}
 
-  console.log("\n[5/5] Opening the production homepage.");
-  await run("/usr/bin/open", [`${SITE_URL}/?launch=${Date.now()}`]);
-  console.log("\nDONE · Official CA activated and the production site redeployed.\n");
-  await saveLocalState(snapshot, {
-    vercelRuntimeFingerprint: nextState.vercelRuntimeFingerprint || stateFingerprint(snapshot),
+export function assertRuntimeReady(runtime, { ca, snapshot, manifest }) {
+  if (runtime?.schemaVersion !== 1) {
+    throw new Error("RUNTIME_SCHEMA_MISMATCH · schemaVersion must be 1.");
+  }
+  const checkEntries = Object.entries(runtime?.checks || {});
+  const missingChecks = REQUIRED_RUNTIME_CHECKS.filter((name) => !(name in (runtime?.checks || {})));
+  const failedChecks = checkEntries
+    .filter(([, passed]) => passed !== true)
+    .map(([name]) => name);
+  for (const name of missingChecks) if (!failedChecks.includes(name)) failedChecks.push(name);
+  const stockRegistry = runtime?.operations?.stockAssetRegistry;
+  const audit = runtime?.operations?.independentAudit;
+  const manifestAudit = manifest?.independentAudit;
+  const auditEvidenceReady = audit?.status === "VERIFIED"
+    && audit.manifestBound === true
+    && audit.verified === true
+    && audit.reportUrl === manifestAudit?.reportUrl
+    && audit.sha256 === manifestAudit?.sha256
+    && audit.firm === manifestAudit?.firm
+    && audit.completedAt === manifestAudit?.completedAt
+    && audit.scope?.manifestId === manifestAudit?.scope?.manifestId
+    && audit.scope?.protocolVersion === manifestAudit?.scope?.protocolVersion
+    && same(audit.scope?.registry, manifestAudit?.scope?.registry)
+    && same(audit.scope?.gatewayImplementation, manifestAudit?.scope?.gatewayImplementation)
+    && audit.scope?.gatewayImplementationRuntimeCodeHash
+      === manifestAudit?.scope?.gatewayImplementationRuntimeCodeHash
+    && audit.scope?.sourceCommit === manifestAudit?.scope?.sourceCommit;
+  const releaseManifest = runtime?.releaseManifest;
+  const operationsReady = runtime?.operations?.environment === "production"
+    && runtime.operations.eligibilityProviderMode === "external"
+    && runtime.operations.eligibilityExternalRequired === true
+    && runtime.operations.statsIndexer?.configured === true
+    && runtime.operations.statsIndexer?.healthy === true
+    && runtime.operations.statsIndexer?.boundedFallbackEnabled === false
+    && runtime.operations.distributedRateLimitHealthy === true
+    && runtime.operations.monitoringHealthy === true
+    && runtime.operations.independentAuditVerified === true
+    && auditEvidenceReady
+    && stockRegistry?.verified === true
+    && stockRegistry.tokenSymbol === "QQQ"
+    && stockRegistry.status === "ASSET_STATUS_ACTIVE"
+    && stockRegistry.marketWhole === "TRADING_STATUS_TRADABLE"
+    && stockRegistry.marketFractional === "TRADING_STATUS_TRADABLE";
+  const releaseManifestReady = releaseManifest?.required === true
+    && releaseManifest.manifestId === manifest.manifestId
+    && releaseManifest.tradingActive === true
+    && releaseManifest.bound === true;
+  if (
+    runtime?.ready !== true
+    || runtime?.status !== "READY"
+    || missingChecks.length > 0
+    || failedChecks.length > 0
+    || !operationsReady
+    || !releaseManifestReady
+  ) {
+    throw new Error(
+      `RUNTIME_NOT_READY · status ${runtime?.status || "UNKNOWN"}; failed checks: ${failedChecks.join(", ") || (!releaseManifestReady ? "releaseManifest" : !operationsReady ? "productionOperations" : "unknown")}.`,
+    );
+  }
+  const confirmations = runtime?.limits?.confirmations;
+  if (!Number.isSafeInteger(confirmations) || confirmations < 1 || confirmations > 100) {
+    throw new Error("RUNTIME_LIMITS_INVALID · confirmations must be an integer from 1 to 100.");
+  }
+  const now = Date.now();
+  const checkedAt = Date.parse(runtime.checkedAt || "");
+  const expiresAt = Date.parse(runtime.expiresAt || "");
+  const stockCheckedAt = Date.parse(stockRegistry.checkedAt || "");
+  if (
+    !Number.isFinite(checkedAt)
+    || !Number.isFinite(expiresAt)
+    || checkedAt > now + OPERATOR_PROOF_FUTURE_SKEW_SECONDS * 1_000
+    || now - checkedAt > MAX_RUNTIME_AGE_MS
+    || expiresAt <= now
+    || expiresAt <= checkedAt
+    || expiresAt - checkedAt > MAX_RUNTIME_VALIDITY_MS
+    || !Number.isFinite(stockCheckedAt)
+    || stockCheckedAt > now + OPERATOR_PROOF_FUTURE_SKEW_SECONDS * 1_000
+    || now - stockCheckedAt > MAX_RUNTIME_AGE_MS
+  ) {
+    throw new Error("RUNTIME_STALE · runtime or Stock Asset Registry proof is outside the freshness window.");
+  }
+  const bindings = [
+    ["chain", runtime.chainId, manifest.chainId, (a, b) => a === b],
+    ["protocol version", runtime.protocolVersion, manifest.protocolVersion, (a, b) => a === b],
+    ["Registry", runtime.registryAddress, snapshot.registryAddress, same],
+    ["factory alias", runtime.factoryAddress, snapshot.registryAddress, same],
+    ["project authority", runtime.projectAuthorityAddress, snapshot.projectAuthority, same],
+    ["official CA", runtime.officialTokenAddress, ca, same],
+    ["Gateway", runtime.gatewayAddress, snapshot.currentMarket, same],
+    ["implementation", runtime.implementationAddress, snapshot.implementationAddress, same],
+    ["implementation code hash", runtime.implementationCodeHash, snapshot.implementationCodeHash,
+      (a, b) => String(a || "").toLowerCase() === String(b || "").toLowerCase()],
+    ["eligibility checker", runtime.eligibilityCheckerAddress, snapshot.eligibilityCheckerAddress, same],
+    ["eligibility signer", runtime.eligibilitySignerAddress, snapshot.eligibilityAuthority, same],
+    ["eligibility policy", runtime.policyHash, snapshot.eligibilityPolicyHash,
+      (a, b) => String(a || "").toLowerCase() === String(b || "").toLowerCase()],
+    ["stock adapter", runtime.stockAdapterAddress, snapshot.stockAdapterAddress, same],
+    ["canonical Stock Token", runtime.stockTokenAddress, CANONICAL_QQQ, same],
+    ["canonical input token", runtime.inputTokenAddress, WETH, same],
+    ["activation block", runtime.activatedBlock, snapshot.activatedBlock, (a, b) => a === b],
+  ];
+  for (const [label, actual, expected, compare] of bindings) {
+    if (!compare(actual, expected)) {
+      throw new Error(`RUNTIME_BINDING_MISMATCH · ${label} is ${actual}; expected ${expected}.`);
+    }
+  }
+  if (
+    !/^0x[a-fA-F0-9]{64}$/.test(runtime.gatewayCodeHash || "")
+    || /^0x0{64}$/i.test(runtime.gatewayCodeHash)
+    || runtime.marketRegistered !== true
+    || runtime.gatewayInitializedOnchain !== true
+    || runtime.gatewayPaused !== false
+    || runtime.explicitFeeBps !== 0
+  ) {
+    throw new Error("RUNTIME_BINDING_MISMATCH · Gateway state or code proof is invalid.");
+  }
+  return runtime;
+}
+
+function assertEligibilityReady(eligibility, probeWallet) {
+  if (eligibility?.eligible !== true || !eligibility.proof?.token) {
+    throw new Error(`ELIGIBILITY_NOT_READY · ${eligibility?.reason || "no signed provider proof"}.`);
+  }
+  if (!same(eligibility.proof.wallet, probeWallet)) {
+    throw new Error("ELIGIBILITY_BINDING_MISMATCH · proof wallet differs from the probe wallet.");
+  }
+  const expiry = Date.parse(eligibility.expiresAt || "");
+  if (!Number.isFinite(expiry) || expiry <= Date.now()) {
+    throw new Error("ELIGIBILITY_STALE · eligibility proof is expired.");
+  }
+  return eligibility;
+}
+
+function assertQuoteReady(quote, {
+  ca,
+  snapshot,
+  manifest,
+  runtime,
+  probeWallet,
+  amountInWei,
+}) {
+  if (quote?.schemaVersion !== 1) throw new Error("QUOTE_INVALID · schemaVersion is not 1.");
+  if (!same(quote.transaction?.to, snapshot.currentMarket)) {
+    throw new Error("QUOTE_BINDING_MISMATCH · transaction target is not the canonical Gateway.");
+  }
+  if (quote.transaction?.chainId !== manifest.chainId) {
+    throw new Error("QUOTE_BINDING_MISMATCH · transaction chain is not Robinhood Chain.");
+  }
+  if (BigInt(quote.amountInWei || 0) !== amountInWei || BigInt(quote.transaction?.value || 0) !== amountInWei) {
+    throw new Error("QUOTE_BINDING_MISMATCH · quote value differs from the requested probe amount.");
+  }
+  if (
+    BigInt(quote.minProjectOut || 0) <= 0n
+    || BigInt(quote.minStockOut || 0) <= 0n
+    || BigInt(quote.projectAmountOut || 0) < BigInt(quote.minProjectOut || 0)
+    || BigInt(quote.stockAmountOut || 0) < BigInt(quote.minStockOut || 0)
+  ) {
+    throw new Error("QUOTE_INVALID · both settlement legs must have positive, simulated output.");
+  }
+  if (quote.quoteSource?.type !== "ONCHAIN_QUOTER_V2_AND_GATEWAY_ETH_CALL") {
+    throw new Error("QUOTE_INVALID · quote does not attest onchain pricing plus Gateway eth_call.");
+  }
+  if (!quote.transaction?.data || !/^0x[a-fA-F0-9]+$/.test(quote.transaction.data)) {
+    throw new Error("QUOTE_INVALID · transaction calldata is missing.");
+  }
+  if (!quote.eligibilityProof?.signature || !quote.eligibilityProof?.providerDecision) {
+    throw new Error("QUOTE_INVALID · signed eligibility proof is missing.");
+  }
+  let decoded;
+  try {
+    decoded = decodeFunctionData({ abi: gatewayAbi, data: quote.transaction.data });
+  } catch {
+    throw new Error("QUOTE_INVALID · transaction calldata is not buyNative.");
+  }
+  if (decoded.functionName !== "buyNative") {
+    throw new Error("QUOTE_INVALID · transaction calldata is not buyNative.");
+  }
+  const [minProjectOut, minStockOut, recipient, deadline, eligibilityDeadline, signature] = decoded.args;
+  if (
+    minProjectOut !== BigInt(quote.minProjectOut)
+    || minStockOut !== BigInt(quote.minStockOut)
+    || !same(recipient, probeWallet)
+    || signature.toLowerCase() !== String(quote.eligibilityProof.signature).toLowerCase()
+  ) {
+    throw new Error("QUOTE_CALLDATA_MISMATCH · recipient, minimum outputs or eligibility signature changed.");
+  }
+  const quoteDeadline = BigInt(Math.floor(Date.parse(quote.expiresAt || "") / 1_000));
+  if (
+    deadline !== quoteDeadline
+    || eligibilityDeadline !== BigInt(quote.eligibilityProof.validUntil || 0)
+    || eligibilityDeadline > deadline
+  ) {
+    throw new Error("QUOTE_CALLDATA_MISMATCH · quote or eligibility deadline changed.");
+  }
+  const typed = quote.typedPayload;
+  if (
+    typed?.primaryType !== "Eligibility"
+    || typed.domain?.chainId !== manifest.chainId
+    || !same(typed.domain?.verifyingContract, runtime.eligibilityCheckerAddress)
+    || !same(typed.message?.market, snapshot.currentMarket)
+    || !same(typed.message?.payer, probeWallet)
+    || !same(typed.message?.recipient, probeWallet)
+    || BigInt(typed.message?.validUntil || 0) !== eligibilityDeadline
+    || String(typed.message?.policyHash || "").toLowerCase()
+      !== String(runtime.policyHash || "").toLowerCase()
+  ) {
+    throw new Error("QUOTE_ELIGIBILITY_MISMATCH · typed proof is not bound to the runtime and probe wallet.");
+  }
+  if (
+    !same(quote.eligibilityProof.checker, runtime.eligibilityCheckerAddress)
+    || !same(quote.eligibilityProof.signer, runtime.eligibilitySignerAddress)
+    || String(quote.eligibilityProof.policyHash || "").toLowerCase()
+      !== String(runtime.policyHash || "").toLowerCase()
+    || (quote.eligibilityProof.providerDecision.wallet
+      && !same(quote.eligibilityProof.providerDecision.wallet, probeWallet))
+  ) {
+    throw new Error("QUOTE_ELIGIBILITY_MISMATCH · public proof fields differ from the verified runtime.");
+  }
+  if (
+    quote.quoteSource.projectPath !== runtime.routes?.projectPath
+    || quote.quoteSource.stockPath !== runtime.routes?.stockPath
+    || BigInt(quote.quoteSource.simulatedAtBlock || 0) < BigInt(snapshot.activatedBlock)
+  ) {
+    throw new Error("QUOTE_ROUTE_MISMATCH · quote routes or simulation block differ from the verified runtime.");
+  }
+  const expiry = Date.parse(quote.expiresAt || "");
+  if (!Number.isFinite(expiry) || expiry <= Date.now() + 5_000) {
+    throw new Error("QUOTE_STALE · quote expires too soon for an independent simulation.");
+  }
+  return { ...quote, ca, probeWallet };
+}
+
+export async function verifyIndependentEthCall(quote, probeWallet, publicClient = client) {
+  let result;
+  try {
+    result = await publicClient.call({
+      account: probeWallet,
+      to: quote.transaction.to,
+      data: quote.transaction.data,
+      value: BigInt(quote.transaction.value),
+    });
+  } catch {
+    throw new Error("ETH_CALL_FAILED · the exact quoted 99/1 transaction reverted independently.");
+  }
+  if (!result?.data) throw new Error("ETH_CALL_FAILED · Gateway returned no result data.");
+  let projectAmountOut;
+  let stockAmountOut;
+  try {
+    [projectAmountOut, stockAmountOut] = decodeFunctionResult({
+      abi: gatewayAbi,
+      functionName: "buyNative",
+      data: result.data,
+    });
+  } catch {
+    throw new Error("ETH_CALL_FAILED · Gateway returned undecodable result data.");
+  }
+  if (
+    projectAmountOut < BigInt(quote.minProjectOut)
+    || stockAmountOut < BigInt(quote.minStockOut)
+  ) {
+    throw new Error("ETH_CALL_OUTPUT_MISMATCH · independent outputs are below signed minimums.");
+  }
+  return { projectAmountOut, stockAmountOut };
+}
+
+export function assertCanaryEvidence({
+  transaction,
+  receipt,
+  event,
+  callRecipient,
+  latestBlock,
+  gateway,
+  probeWallet,
+  activatedBlock,
+  minimumConfirmations = DEFAULT_CANARY_CONFIRMATIONS,
+  maximumConfirmations = DEFAULT_CANARY_MAX_CONFIRMATIONS,
+  minimumAmountWei = DEFAULT_PROBE_AMOUNT_WEI,
+  maximumAmountWei = DEFAULT_CANARY_MAX_AMOUNT_WEI,
+}) {
+  if (receipt?.status !== "success") throw new Error("CANARY_FAILED · transaction receipt is not successful.");
+  if (!same(transaction?.to, gateway)) throw new Error("CANARY_BINDING_MISMATCH · transaction did not target the Gateway.");
+  if (!same(transaction?.from, probeWallet)) throw new Error("CANARY_BINDING_MISMATCH · payer differs from the probe wallet.");
+  if (
+    !same(callRecipient, probeWallet)
+    || !same(event?.payer, probeWallet)
+    || !same(event?.recipient, probeWallet)
+  ) {
+    throw new Error("CANARY_BINDING_MISMATCH · SplitBuy payer/recipient differs from the probe wallet.");
+  }
+  if (
+    BigInt(receipt.blockNumber) < BigInt(activatedBlock)
+    || (transaction.blockNumber !== null
+      && transaction.blockNumber !== undefined
+      && BigInt(transaction.blockNumber) !== BigInt(receipt.blockNumber))
+  ) {
+    throw new Error("CANARY_BLOCK_MISMATCH · canary predates activation or has inconsistent inclusion data.");
+  }
+  const amountInWei = BigInt(transaction?.value || 0);
+  if (
+    amountInWei < BigInt(minimumAmountWei)
+    || amountInWei > BigInt(maximumAmountWei)
+    || BigInt(event?.grossAmountIn || 0) !== amountInWei
+    || BigInt(event?.projectAmountIn || 0) <= 0n
+    || BigInt(event?.stockAmountIn || 0) <= 0n
+    || BigInt(event?.projectAmountOut || 0) <= 0n
+    || BigInt(event?.stockAmountOut || 0) <= 0n
+  ) {
+    throw new Error("CANARY_OUTPUT_MISMATCH · canary amount or two-leg settlement is outside the release bounds.");
+  }
+  const confirmations = BigInt(latestBlock) - BigInt(receipt.blockNumber) + 1n;
+  if (confirmations < BigInt(minimumConfirmations)) {
+    throw new Error(`CANARY_UNCONFIRMED · ${confirmations} confirmations; require ${minimumConfirmations}.`);
+  }
+  if (confirmations > BigInt(maximumConfirmations)) {
+    throw new Error(
+      `CANARY_STALE · ${confirmations} confirmations; maximum age is ${maximumConfirmations} blocks.`,
+    );
+  }
+  return {
+    amountInWei: amountInWei.toString(),
+    blockNumber: Number(receipt.blockNumber),
+    confirmations: Number(confirmations),
+  };
+}
+
+export async function verifyCanaryTransaction({
+  transactionHash,
+  gateway,
+  probeWallet,
+  activatedBlock,
+  minimumConfirmations = DEFAULT_CANARY_CONFIRMATIONS,
+  maximumConfirmations = DEFAULT_CANARY_MAX_CONFIRMATIONS,
+  minimumAmountWei = DEFAULT_PROBE_AMOUNT_WEI,
+  maximumAmountWei = DEFAULT_CANARY_MAX_AMOUNT_WEI,
+  publicClient = client,
+}) {
+  const normalizedHash = requireHash(transactionHash, "Canary transaction hash");
+  const [transaction, receipt, latestBlock] = await Promise.all([
+    publicClient.getTransaction({ hash: normalizedHash }),
+    publicClient.getTransactionReceipt({ hash: normalizedHash }),
+    publicClient.getBlockNumber(),
+  ]);
+  const events = [];
+  for (const log of receipt.logs || []) {
+    if (!same(log.address, gateway)) continue;
+    try {
+      const decoded = decodeEventLog({
+        abi: splitBuyEventAbi,
+        data: log.data,
+        topics: log.topics,
+      });
+      if (decoded.eventName === "SplitBuy") events.push(decoded.args);
+    } catch {
+      // Ignore unrelated Gateway logs.
+    }
+  }
+  if (events.length !== 1) {
+    throw new Error(`CANARY_EVENT_MISMATCH · expected one SplitBuy event, found ${events.length}.`);
+  }
+  let decodedCall;
+  try {
+    decodedCall = decodeFunctionData({ abi: gatewayAbi, data: transaction.input });
+  } catch {
+    throw new Error("CANARY_CALLDATA_MISMATCH · transaction input is not buyNative.");
+  }
+  if (decodedCall.functionName !== "buyNative") {
+    throw new Error("CANARY_CALLDATA_MISMATCH · transaction input is not buyNative.");
+  }
+  return assertCanaryEvidence({
+    transaction,
+    receipt,
+    event: events[0],
+    callRecipient: decodedCall.args[2],
+    latestBlock,
+    gateway,
+    probeWallet,
+    activatedBlock,
+    minimumConfirmations,
+    maximumConfirmations,
+    minimumAmountWei,
+    maximumAmountWei,
   });
 }
 
-async function checkOnly() {
-  console.log("\nCHECK MODE · NO WALLET REQUEST · NO TRANSACTION\n");
-  const chainId = await client.getChainId();
-  if (chainId !== 4663) throw new Error(`RPC returned unexpected chain ${chainId}.`);
-  const balance = await controlBalance();
-  console.log(`PASS · Robinhood Chain RPC: ${chainId}`);
-  console.log(`CONTROL WALLET GAS: ${formatEther(balance)} ETH`);
-  if (balance < MIN_PREPARE_BALANCE_WEI) {
-    console.log("NOTICE · Top up to 0.005 ETH before PREPARE mode.");
+export async function runProductionGate({
+  ca,
+  snapshot,
+  manifest,
+  operatorControlProof,
+  probeWallet,
+  canaryTransactionHash,
+  amountInWei = DEFAULT_PROBE_AMOUNT_WEI,
+  minimumConfirmations = DEFAULT_CANARY_CONFIRMATIONS,
+  maximumCanaryConfirmations = DEFAULT_CANARY_MAX_CONFIRMATIONS,
+  maximumCanaryAmountWei = DEFAULT_CANARY_MAX_AMOUNT_WEI,
+  siteUrl = SITE_URL,
+  fetchImpl = fetch,
+  publicClient = client,
+  canaryVerifier = verifyCanaryTransaction,
+  codeCommitLoader = readReleaseCodeCommit,
+}) {
+  const wallet = requireAddress(probeWallet, "Probe wallet");
+  const canaryHash = requireHash(canaryTransactionHash, "Canary transaction hash");
+  if (amountInWei <= 0n) throw new Error("Probe amount must be positive.");
+  const auditedOperatorProof = await auditOperatorControlProof(manifest, operatorControlProof, {
+    codeCommit: operatorControlProof?.codeCommit,
+  });
+  const operatorProofId = operatorProofIdentifier(auditedOperatorProof);
+  if (!consumedOperatorProofs.has(operatorProofId)) {
+    throw new Error(
+      "OPERATOR_PROOF_NOT_CONSUMED · this launch process did not verify the fresh operator challenge.",
+    );
   }
-  const state = await loadLocalState();
-  if (!state) {
-    console.log("READY FOR PREPARE · No replacement Registry has been deployed yet.");
+  if (usedOperatorProofsForGate.has(operatorProofId)) {
+    throw new Error("OPERATOR_PROOF_REPLAYED · this proof already started a production gate in this process.");
+  }
+  const gateNowSeconds = Math.floor(Date.now() / 1_000);
+  if (
+    auditedOperatorProof.issuedAt > gateNowSeconds + OPERATOR_PROOF_FUTURE_SKEW_SECONDS
+    || auditedOperatorProof.expiresAt <= gateNowSeconds
+  ) {
+    throw new Error("OPERATOR_PROOF_EXPIRED · operator control expired before the production gate started.");
+  }
+  await assertReleaseCommitUnchanged(auditedOperatorProof.codeCommit, { codeCommitLoader });
+  usedOperatorProofsForGate.add(operatorProofId);
+
+  const runtime = assertRuntimeReady(
+    await requestJson(`${siteUrl}/api/runtime?gate=${Date.now()}`, {}, fetchImpl),
+    { ca, snapshot, manifest },
+  );
+  console.log("PASS · [1/5] Production runtime is READY with exact manifest bindings.");
+
+  const commonBody = {
+    wallet,
+    termsAccepted: true,
+    notUSPerson: true,
+  };
+  const eligibility = assertEligibilityReady(
+    await requestJson(`${siteUrl}/api/eligibility`, {
+      method: "POST",
+      body: JSON.stringify(commonBody),
+    }, fetchImpl),
+    wallet,
+  );
+  console.log("PASS · [2/5] Eligibility provider returned a live signed decision.");
+
+  const quote = assertQuoteReady(
+    await requestJson(`${siteUrl}/api/quote`, {
+      method: "POST",
+      body: JSON.stringify({
+        ...commonBody,
+        recipient: wallet,
+        amountInWei: amountInWei.toString(),
+        slippageBps: runtime.limits?.defaultSlippageBps,
+      }),
+    }, fetchImpl),
+    { ca, snapshot, manifest, runtime, probeWallet: wallet, amountInWei },
+  );
+  console.log("PASS · [3/5] Quote has two positive legs and a signed transaction payload.");
+
+  await verifyIndependentEthCall(quote, wallet, publicClient);
+  console.log("PASS · [4/5] Independent eth_call succeeded for the exact quoted transaction.");
+
+  const canary = await canaryVerifier({
+    transactionHash: canaryHash,
+    gateway: snapshot.currentMarket,
+    probeWallet: wallet,
+    activatedBlock: snapshot.activatedBlock,
+    minimumConfirmations,
+    maximumConfirmations: maximumCanaryConfirmations,
+    minimumAmountWei: amountInWei,
+    maximumAmountWei: maximumCanaryAmountWei,
+    publicClient,
+  });
+  console.log(`PASS · [5/5] Mainnet canary settled both legs (${canary.confirmations} confirmations).`);
+  completedOperatorProofsForGate.add(operatorProofId);
+
+  return Object.freeze({
+    status: "GO",
+    checkedAt: new Date().toISOString(),
+    chainId: manifest.chainId,
+    manifestId: manifest.manifestId,
+    protocolVersion: manifest.protocolVersion,
+    manifestSha256: deploymentManifestDigest(manifest),
+    registryAddress: snapshot.registryAddress,
+    launchOperator: manifest.launchOperator,
+    codeCommit: auditedOperatorProof.codeCommit,
+    operatorControlProof: auditedOperatorProof,
+    officialTokenAddress: ca,
+    gatewayAddress: snapshot.currentMarket,
+    gatewayCodeHash: runtime.gatewayCodeHash,
+    implementationAddress: runtime.implementationAddress,
+    implementationCodeHash: runtime.implementationCodeHash,
+    projectAdapterAddress: runtime.projectAdapterAddress,
+    stockAdapterAddress: runtime.stockAdapterAddress,
+    stockTokenAddress: runtime.stockTokenAddress,
+    explicitFeeBps: runtime.explicitFeeBps,
+    activatedBlock: runtime.activatedBlock,
+    runtimeCheckedAt: runtime.checkedAt,
+    runtimeExpiresAt: runtime.expiresAt,
+    runtimeChecks: runtime.checks,
+    operations: runtime.operations,
+    independentAudit: runtime.operations.independentAudit,
+    eligibilityExpiresAt: eligibility.expiresAt,
+    quoteExpiresAt: quote.expiresAt,
+    quoteSimulatedAtBlock: quote.quoteSource.simulatedAtBlock,
+    canaryTransactionHash: canaryHash,
+    canaryAmountInWei: canary.amountInWei,
+    canaryBlockNumber: canary.blockNumber,
+    canaryConfirmations: canary.confirmations,
+  });
+}
+
+export async function assertOperatorProofCurrentForPromotion(manifest, operatorControlProof, {
+  codeCommitLoader = readReleaseCodeCommit,
+  nowSeconds = Math.floor(Date.now() / 1_000),
+} = {}) {
+  const audited = await auditOperatorControlProof(manifest, operatorControlProof, {
+    codeCommit: operatorControlProof?.codeCommit,
+  });
+  const proofId = operatorProofIdentifier(audited);
+  if (!completedOperatorProofsForGate.has(proofId)) {
+    throw new Error("OPERATOR_PROOF_GATE_MISMATCH · proof did not complete this process's Production gate.");
+  }
+  if (
+    audited.issuedAt > nowSeconds + OPERATOR_PROOF_FUTURE_SKEW_SECONDS
+    || audited.expiresAt <= nowSeconds
+  ) {
+    throw new Error("OPERATOR_PROOF_EXPIRED · operator control expired before candidate promotion.");
+  }
+  await assertReleaseCommitUnchanged(audited.codeCommit, { codeCommitLoader });
+  return audited;
+}
+
+export async function releaseProductionCandidate({
+  manifest,
+  operatorControlProof,
+  gateArguments,
+  codeCommitLoader = readReleaseCodeCommit,
+  candidateDeployImpl = deployProductionCandidateAtCommit,
+  gateImpl = runProductionGate,
+  finalProofGuardImpl = assertOperatorProofCurrentForPromotion,
+  promoteImpl = promoteProductionCandidateAtCommit,
+}) {
+  const candidate = await candidateDeployImpl(operatorControlProof?.codeCommit, { codeCommitLoader });
+  console.log(`PASS · Production candidate staged without alias promotion: ${candidate.candidateUrl}`);
+  const artifact = await gateImpl({
+    ...(gateArguments || {}),
+    manifest,
+    operatorControlProof,
+    siteUrl: candidate.candidateUrl,
+    codeCommitLoader,
+  });
+  if (artifact?.status !== "GO") {
+    throw new Error("RELEASE_GATE_NOT_GO · candidate gate did not return an explicit GO artifact.");
+  }
+  await finalProofGuardImpl(manifest, operatorControlProof, { codeCommitLoader });
+  await promoteImpl(candidate.candidateUrl, operatorControlProof.codeCommit, { codeCommitLoader });
+  return Object.freeze({
+    ...artifact,
+    candidateDeploymentUrl: candidate.candidateUrl,
+    promotedAt: new Date().toISOString(),
+  });
+}
+
+async function prepareProduction() {
+  console.log("\nPREPARE MODE · PINNED DEPLOYMENT ONLY · NO CHAIN TRANSACTION\n");
+  const codeCommit = await readReleaseCodeCommit();
+  const manifest = await loadDeploymentManifest();
+  const snapshot = await readAndValidateRegistry(manifest);
+  console.log(`PASS · Sole deployment manifest: ${manifest.manifestId}`);
+  console.log(`PASS · Registry: ${snapshot.registryAddress}`);
+  console.log(`PASS · Launch operator: ${snapshot.launchOperator}`);
+  console.log(`PASS · Clean release commit: ${codeCommit}`);
+  const prepared = await prepareInactiveProductionSite({ manifest, snapshot, codeCommit });
+  console.log(`PASS · Inactive candidate promoted from unchanged commit: ${prepared.candidateUrl}`);
+  console.log("PREPARED · Public pre-launch deployment updated; market readiness was not asserted.");
+}
+
+async function launchOfficialCa(ca, {
+  preflightOnly = false,
+  probeWallet,
+  canaryTransactionHash,
+  signatureProvider,
+  codeCommitLoader = readReleaseCodeCommit,
+} = {}) {
+  const manifest = await loadDeploymentManifest();
+  const snapshot = await readAndValidateRegistry(manifest);
+  const checked = await preflight(ca, snapshot, manifest);
+  console.log(checked.alreadyLive
+    ? "PASS · Active CA and Gateway match the reviewed deployment manifest."
+    : "PASS · Official Pons token, canonical pool and activation eth_call verified.");
+  if (preflightOnly) {
+    console.log("PREFLIGHT PASS · NO TRANSACTION SENT · RELEASE REMAINS NO-GO.");
     return;
   }
-  const snapshot = await readAndValidateRegistry(state.registryAddress);
+
+  const operatorControlProof = await collectFreshOperatorProof(manifest, {
+    signatureProvider,
+    codeCommitLoader,
+  });
+  console.log("PASS · Launch operator control proof matches the pinned manifest.");
+  if (!checked.alreadyLive || !manifest.tradingActive) {
+    throw new Error(
+      "MARKET_NOT_ACTIVATED · activate through the controlled signer, then update and review the sole deployment manifest from the confirmed receipt.",
+    );
+  }
+
+  console.log("\nSynchronizing and staging the manifest-bound Production candidate.");
+  await syncVercelRuntime(snapshot, manifest);
+  const artifact = await releaseProductionCandidate({
+    manifest,
+    operatorControlProof,
+    codeCommitLoader,
+    gateArguments: {
+      ca,
+      snapshot,
+      probeWallet,
+      canaryTransactionHash,
+    },
+  });
+  console.log("PASS · Candidate passed every gate and was promoted to the public Production alias.");
+  console.log(`\nGO · ${JSON.stringify(artifact)}\n`);
+  await run("/usr/bin/open", [`${SITE_URL}/?launch=${Date.now()}`]);
+}
+
+async function checkOnly({ signatureProvider, codeCommitLoader = readReleaseCodeCommit } = {}) {
+  console.log("\nCHECK MODE · READ ONLY · PERSONAL_SIGN ONLY · NO TRANSACTION\n");
+  const manifest = await loadDeploymentManifest();
+  const chainId = await client.getChainId();
+  if (chainId !== manifest.chainId) throw new Error(`RPC returned unexpected chain ${chainId}.`);
+  const snapshot = await readAndValidateRegistry(manifest);
+  const balance = await client.getBalance({ address: manifest.launchOperator });
+  console.log(`PASS · Sole deployment manifest: ${manifest.manifestId}`);
+  console.log(`PASS · Robinhood Chain RPC: ${chainId}`);
   console.log(`PASS · Registry: ${snapshot.registryAddress}`);
-  console.log(`PASS · Operator authorized: ${snapshot.operatorAuthorized ? "YES" : "NO"}`);
+  console.log(`PASS · Manifest/onchain project authority: ${snapshot.projectAuthority}`);
+  console.log(`PASS · Manifest/onchain launch operator: ${snapshot.launchOperator}`);
+  console.log(`LAUNCH OPERATOR GAS: ${formatEther(balance)} ETH`);
   console.log(`MARKET: ${snapshot.marketReady ? snapshot.currentOfficialToken : "WAITING FOR OFFICIAL CA"}`);
+  await collectFreshOperatorProof(manifest, {
+    signatureProvider,
+    codeCommitLoader,
+  });
+  console.log("GO FOR CONTROL · launch operator proof is valid; market release gates still run separately.");
+}
+
+function optionValue(arguments_, name, fallback = "") {
+  const inline = arguments_.find((value) => value.startsWith(`${name}=`));
+  if (inline) return inline.slice(name.length + 1);
+  const index = arguments_.indexOf(name);
+  return index >= 0 ? arguments_[index + 1] || "" : fallback;
 }
 
 function printHelp() {
   console.log(`
-401KEK FAST LAUNCH
+401KEK PRODUCTION RELEASE GATE
 
-Double-click behavior:
-  No local Registry   -> opens PREPARE mode
-  Registry prepared   -> asks for the official Pons CA and runs launch mode
+The sole deployment source is contracts/deployments/robinhood-mainnet.json.
+This script never deploys a replacement Registry and never sends an activation or canary transaction.
 
 Options:
-  --prepare           Deploy/authorize the replacement Registry and sync Vercel
-  --check             Read-only RPC, gas and Registry diagnostics
-  --preflight-only CA Validate a real official CA without opening a wallet
-  --help              Show this help
+  --prepare                    Stage/promote only an explicitly inactive pinned pre-launch site
+  --check                      Read-only manifest/RPC/operator-control diagnostics
+  --preflight-only CA          Validate a CA and activation eth_call without a wallet transaction
+  --probe-wallet ADDRESS       Wallet used for eligibility, quote, eth_call and canary binding
+  --canary-tx HASH             Confirmed small mainnet SplitBuy transaction to verify
+  --help                       Show this help
+
+For --check and full release, this process creates a random five-minute challenge
+bound to the manifest, chain, Registry, operator and clean Git commit. Sign the
+exact displayed personal_sign message and paste the signature when prompted.
 `);
 }
 
 async function main() {
-  console.log("\n401KEK · ROBINHOOD CHAIN FAST LAUNCH\n");
+  console.log("\n401KEK · ROBINHOOD CHAIN PRODUCTION RELEASE GATE\n");
   const arguments_ = process.argv.slice(2);
   if (arguments_.includes("--help")) {
     printHelp();
     return;
   }
-  if (arguments_.includes("--check")) {
-    await checkOnly();
-    return;
-  }
-  const forcePrepare = arguments_.includes("--prepare");
-  const preflightOnly = arguments_.includes("--preflight-only");
-  const unknownFlags = arguments_.filter((value) => value.startsWith("--")
-    && !["--prepare", "--preflight-only"].includes(value));
-  if (unknownFlags.length) throw new Error(`Unknown option: ${unknownFlags.join(", ")}`);
-
-  const existingState = await loadLocalState();
-  if (forcePrepare || !existingState) {
+  if (arguments_.includes("--prepare")) {
     await prepareProduction();
     return;
   }
 
+  const preflightOnly = arguments_.includes("--preflight-only");
+  const valueOptions = new Set(["--probe-wallet", "--canary-tx"]);
+  const consumedValues = new Set();
+  for (let index = 0; index < arguments_.length; index += 1) {
+    if (valueOptions.has(arguments_[index])) consumedValues.add(index + 1);
+  }
+  const unknownFlags = arguments_.filter((value) => value.startsWith("--")
+    && value !== "--preflight-only"
+    && value !== "--check"
+    && !valueOptions.has(value)
+    && ![...valueOptions].some((name) => value.startsWith(`${name}=`)));
+  if (unknownFlags.length) throw new Error(`Unknown option: ${unknownFlags.join(", ")}`);
+
   const terminal = createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const caArgument = arguments_.find((value) => !value.startsWith("--"));
+    const signatureProvider = async () => terminal.question("Paste the fresh operator signature: ");
+    if (arguments_.includes("--check")) {
+      await checkOnly({ signatureProvider });
+      return;
+    }
+    const caArgument = arguments_.find((value, index) => !value.startsWith("--") && !consumedValues.has(index));
     const raw = caArgument || await terminal.question("Paste the official Pons CA: ");
     const candidate = raw.trim().replace(/^['"]|['"]$/g, "");
     if (!isAddress(candidate)) throw new Error("CA must be a complete 0x address with 40 hex characters.");
-    await launchOfficialCa(getAddress(candidate), { preflightOnly });
+    await launchOfficialCa(getAddress(candidate), {
+      preflightOnly,
+      probeWallet: optionValue(arguments_, "--probe-wallet", process.env.LAUNCH_PROBE_WALLET),
+      canaryTransactionHash: optionValue(
+        arguments_,
+        "--canary-tx",
+        process.env.CANARY_TRANSACTION_HASH,
+      ),
+      signatureProvider,
+    });
   } finally {
     terminal.close();
   }
