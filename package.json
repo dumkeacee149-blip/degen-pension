@@ -10,11 +10,13 @@
     "preview": "vite preview",
     "test:api": "node --test tests/api-*.test.mjs",
     "test:launch": "node --test tests/launch-*.test.mjs",
+    "test:sandbox": "node --test tests/sandbox-flow.test.mjs tests/sandbox-anvil.test.mjs",
     "test:sites": "node --test tests/sites-worker.test.mjs",
     "test:assets": "node --test tests/build-assets.test.mjs",
     "test:contracts": "cd contracts && forge test",
+    "sandbox": "node scripts/run-sandbox.mjs",
     "generate:deploy": "node scripts/generate-deploy-artifacts.mjs",
-    "verify": "npm run build && npm run test:api && npm run test:launch && npm run test:sites && npm run test:assets && npm run test:contracts"
+    "verify": "npm run build && npm run test:api && npm run test:launch && npm run test:sandbox && npm run test:sites && npm run test:assets && npm run test:contracts"
   },
   "dependencies": {
     "@fontsource/bebas-neue": "^5.3.0",

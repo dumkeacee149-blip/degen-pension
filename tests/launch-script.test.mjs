@@ -191,15 +191,15 @@ test("public production module exposes no transaction or wallet controls", () =>
   );
 });
 
-test("homepage Stock Token proof is CA-bound and never hardcodes the old public snapshot", async () => {
+test("homepage omits the holder strip and Stock Token calculation card without deleting canonical proof logic", async () => {
   const [appSource, statsSource] = await Promise.all([
     readFile(new URL("../src/App.jsx", import.meta.url), "utf8"),
     readFile(new URL("../server/stats.js", import.meta.url), "utf8"),
   ]);
   assert.doesNotMatch(appSource, /483[,_]?291/);
-  assert.match(appSource, /OFFICIAL 99\/1 SELF-BUY CALCULATION/);
-  assert.match(appSource, /ACTIVATION CONFIRMING/);
-  assert.match(appSource, /payer = recipient/);
+  assert.doesNotMatch(appSource, /TOKEN HOLDERS:/);
+  assert.doesNotMatch(appSource, /OFFICIAL 99\/1 SELF-BUY CALCULATION/);
+  assert.doesNotMatch(appSource, /holder-stock-(?:snapshot|dialog)/);
   assert.match(statsSource, /CONFIRMED_SELF_SPLITBUY_USDG_QQQ_SWAPS/);
   assert.match(statsSource, /STOCK_PROOF_SWAP_MISMATCH/);
 });

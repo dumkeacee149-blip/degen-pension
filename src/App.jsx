@@ -8,7 +8,6 @@ import {
   DeviceMobile,
   Hexagon,
   ShareNetwork,
-  UsersThree,
   Wallet,
   X,
 } from "@phosphor-icons/react";
@@ -23,13 +22,13 @@ import {
 } from "./launchRuntime.js";
 import { loadMemberStats } from "./memberStats.js";
 import { useHolderStats } from "./useHolderStats.js";
-import { useHolderStockStats } from "./useHolderStockStats.js";
 import { useMemberStats } from "./useMemberStats.js";
 import { useRuntimeReadiness } from "./useRuntimeReadiness.js";
 
 const CodePage = lazy(() => import("./CodePage.jsx"));
 const FlowPage = lazy(() => import("./FlowPage.jsx"));
 const DeployPage = lazy(() => import("./DeployPage.jsx"));
+const SandboxPage = lazy(() => import("./SandboxPage.jsx"));
 
 function RouteFallback() {
   return (
@@ -42,25 +41,6 @@ function RouteFallback() {
 function shortAddress(value) {
   if (!value) return "";
   return `${value.slice(0, 6)}…${value.slice(-4)}`;
-}
-
-function formatGroupedDecimal(value) {
-  const [whole, fraction = ""] = String(value || "0").split(".");
-  const grouped = BigInt(whole || "0").toLocaleString("en-US");
-  return fraction ? `${grouped}.${fraction}` : grouped;
-}
-
-function formatProofTimestamp(value) {
-  if (!Number.isFinite(value)) return "UNAVAILABLE";
-  return new Date(value).toLocaleString("en-US", {
-    month: "short",
-    day: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: "UTC",
-    timeZoneName: "short",
-  }).toUpperCase();
 }
 
 function useDialogA11y({ open, dialogRef, triggerRef, onClose }) {
@@ -222,7 +202,6 @@ function getPublicStage(stats) {
   if (stats.status === "prelaunch" || stats.status === "unavailable") {
     return {
       key: "prelaunch",
-      status: "TOKEN HOLDERS: WAITING FOR CA",
       headline: ["YOUR WORST", "FINANCIAL DECISION"],
       accent: "NEEDS 1% ADULT SUPERVISION.",
       subline: "BUY THE MEME. ROUTE 1% TO QQQ. PRINT THE RECEIPT.",
@@ -234,7 +213,6 @@ function getPublicStage(stats) {
   if (stats.status === "loading") {
     return {
       key: "loading",
-      status: "TOKEN HOLDERS: COUNTING",
       headline: ["YOUR BAD DECISION", "IS BEING"],
       accent: "AUDITED BY A RACCOON.",
       subline: "READING THE OFFICIAL TOKEN HOLDER COUNT FROM THE CHAIN.",
@@ -246,7 +224,6 @@ function getPublicStage(stats) {
   if (stats.status === "error") {
     return {
       key: "error",
-      status: "TOKEN HOLDERS: DATA UNAVAILABLE",
       headline: ["THE CHAIN SAID", "BE RIGHT"],
       accent: "BACK.",
       subline: "THE COUNTER IS OFFLINE. THE BUY ROUTE IS SEPARATE.",
@@ -260,7 +237,6 @@ function getPublicStage(stats) {
   if (count === 0) {
     return {
       key: stats.status === "stale" ? "stale" : "empty",
-      status: `TOKEN HOLDERS: 0${stats.status === "stale" ? " · STALE" : ""}`,
       headline: ["THE PENSION WALL", "IS PAINFULLY"],
       accent: "EMPTY.",
       subline: stats.status === "stale"
@@ -274,7 +250,6 @@ function getPublicStage(stats) {
   if (count < 100) {
     return {
       key: stats.status === "stale" ? "stale" : "growing",
-      status: `TOKEN HOLDERS: ${count.toLocaleString("en-US")}${stats.status === "stale" ? " · STALE" : ""}`,
       headline: [`${count.toLocaleString("en-US")} BAD DECISIONS.`, "ONE GROWING"],
       accent: "PENSION WALL.",
       subline: "THE RACCOON CHANGES JOBS AS THE OFFICIAL TOKEN GAINS HOLDERS.",
@@ -285,7 +260,6 @@ function getPublicStage(stats) {
   }
   return {
     key: stats.status === "stale" ? "stale" : "crowded",
-    status: `TOKEN HOLDERS: ${count.toLocaleString("en-US")}${stats.status === "stale" ? " · STALE" : ""}`,
     headline: ["THE GROUP CHAT", "HAS A PENSION"],
     accent: "DEPARTMENT NOW.",
     subline: `${count.toLocaleString("en-US")} WALLETS CURRENTLY HOLD THE OFFICIAL TOKEN.`,
@@ -322,7 +296,6 @@ function HomePage() {
   const stage = getPublicStage(holderStats);
   const [amount, setAmount] = useState("");
   const [isBuySheetOpen, setIsBuySheetOpen] = useState(false);
-  const [isHolderStockDialogOpen, setIsHolderStockDialogOpen] = useState(false);
   const [actionState, setActionState] = useState("idle");
   const [actionMessage, setActionMessage] = useState("");
   const [submittedHash, setSubmittedHash] = useState("");
@@ -351,24 +324,11 @@ function HomePage() {
   const receiptVerificationRef = useRef(null);
   const buyDialogRef = useRef(null);
   const buyTriggerRef = useRef(null);
-  const holderStockDialogRef = useRef(null);
-  const holderStockTriggerRef = useRef(null);
   const isBusyRef = useRef(false);
   const actionStateRef = useRef("idle");
   const isBusy = BUSY_ACTION_STATES.has(actionState);
   const runtimeReady = MARKET.bootstrapConfigured && runtime.ready;
   const officialTokenAddress = runtime.canonical?.officialTokenAddress || "";
-  const officialGatewayAddress = runtime.canonical?.gatewayAddress || "";
-  const officialActivatedBlock = runtime.canonical?.activatedBlock || 0;
-  const holderStockBindingReady = Boolean(
-    officialTokenAddress && officialGatewayAddress && officialActivatedBlock,
-  );
-  const holderStockProof = useHolderStockStats({
-    open: isHolderStockDialogOpen,
-    officialTokenAddress,
-    gatewayAddress: officialGatewayAddress,
-    activatedBlock: officialActivatedBlock,
-  });
   const previewFeeBps = runtime.canonical?.explicitFeeBps ?? MARKET.explicitFeeBps ?? 0;
   const showMemberTicket = runtimeReady
     && ["ready", "empty", "stale"].includes(stats.status)
@@ -387,41 +347,6 @@ function HomePage() {
     && notUSPerson
     && !isBusy;
   const receiptFailed = Boolean(submittedHash) && actionState === "error";
-  const holderStockProofReady = ["ready", "empty", "stale"].includes(holderStockProof.status)
-    && holderStockProof.approximateUsdValue !== null;
-  const holderStockCardValue = holderStockProof.status === "error"
-    ? "UNAVAILABLE"
-    : holderStockProof.status === "activation_pending"
-      ? "CONFIRMING CA"
-    : holderStockProofReady
-      ? `≈$${formatGroupedDecimal(holderStockProof.approximateUsdValue)}`
-      : holderStockProof.status === "loading"
-        ? "VERIFYING"
-        : holderStockBindingReady
-          ? "OPEN"
-          : officialTokenAddress
-            ? "BINDING PENDING"
-            : "CA PENDING";
-  const holderStockCardKicker = holderStockProof.status === "stale"
-    ? "LAST VERIFIED · STALE"
-    : holderStockProof.status === "error"
-      ? "CALCULATION UNAVAILABLE"
-      : holderStockProof.status === "activation_pending"
-        ? "ACTIVATION AWAITING CONFIRMATIONS"
-      : "OFFICIAL 99/1 SELF-BUY CALCULATION";
-  const holderStockCardCopy = holderStockProof.status === "stale"
-    ? holderStockProof.error
-      ? "REFRESH FAILED · OPEN FOR LAST VERIFIED INPUTS AND RETRY"
-      : "PROOF EXPIRED · OPEN TO REFRESH THE CONFIRMED TOTAL"
-    : holderStockProof.status === "error"
-      ? "OPEN TO RETRY THE COMPLETE ONCHAIN VERIFICATION"
-      : holderStockProof.status === "activation_pending"
-        ? "THE ACTIVATION BLOCK IS NOT CONFIRMATION-SAFE YET"
-      : holderStockBindingReady
-        ? "OPEN THE VERIFIED INPUTS, FORMULA & ONCHAIN SOURCES"
-        : officialTokenAddress
-          ? "WAITING FOR CANONICAL GATEWAY BINDING · NO ESTIMATE SHOWN"
-          : "WAITING FOR THE OFFICIAL CA · NO ESTIMATE SHOWN";
 
   const closeBuyDialog = () => {
     if (actionStateRef.current === "submitting") return;
@@ -432,21 +357,12 @@ function HomePage() {
     }
     setIsBuySheetOpen(false);
   };
-  const closeHolderStockDialog = () => setIsHolderStockDialogOpen(false);
-
   useDialogA11y({
     open: isBuySheetOpen,
     dialogRef: buyDialogRef,
     triggerRef: buyTriggerRef,
     onClose: closeBuyDialog,
   });
-  useDialogA11y({
-    open: isHolderStockDialogOpen,
-    dialogRef: holderStockDialogRef,
-    triggerRef: holderStockTriggerRef,
-    onClose: closeHolderStockDialog,
-  });
-
   useEffect(() => {
     document.title = "DEGEN PENSION - 99% APE. 1% ADULT.";
   }, []);
@@ -934,27 +850,11 @@ function HomePage() {
             {stage.headline.map((line) => <span key={line}>{line}</span>)}
             <em>{stage.accent}</em>
           </h1>
-          <div className="member-status"><UsersThree size={19} weight="fill" />{stage.status}</div>
           <p className="stage-subline">{stage.subline}</p>
           <div className={`hero-ca${officialTokenAddress ? " hero-ca-live" : ""}`}>
             <span>CA:</span>
             <code>{officialTokenAddress || "PENDING"}</code>
           </div>
-          <button
-            ref={holderStockTriggerRef}
-            className="holder-stock-snapshot"
-            type="button"
-            aria-haspopup="dialog"
-            aria-controls="holder-stock-dialog"
-            onClick={() => setIsHolderStockDialogOpen(true)}
-          >
-            <span className="holder-stock-snapshot-kicker">{holderStockCardKicker}</span>
-            <span className="holder-stock-snapshot-main">
-              <strong>{holderStockCardValue}</strong>
-              <span>QQQ BOUGHT THROUGH CONFIRMED SELF-DIRECTED 99/1 TRADES</span>
-            </span>
-            <small>{holderStockCardCopy}</small>
-          </button>
           <div className="raccoon-media">
             <img className="raccoon-art" src={stage.art} alt="The tired deadpan office raccoon reacting to the current official member stage" />
             <span className="raccoon-form">{stage.form}</span>
@@ -1061,141 +961,6 @@ function HomePage() {
           </p>
         </div>
       </main>
-
-      {isHolderStockDialogOpen && (
-        <div className="buy-dialog-backdrop holder-stock-dialog-backdrop" onMouseDown={(event) => {
-          if (event.target === event.currentTarget) closeHolderStockDialog();
-        }}>
-          <section
-            id="holder-stock-dialog"
-            ref={holderStockDialogRef}
-            className="buy-dialog holder-stock-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="holder-stock-dialog-title"
-            aria-describedby="holder-stock-dialog-description"
-            tabIndex={-1}
-          >
-            <div className="buy-dialog-head holder-stock-dialog-head">
-              <div>
-                <span id="holder-stock-dialog-title">OFFICIAL 99/1 STOCK-TOKEN CALCULATION</span>
-                <small>CURRENT CANONICAL GATEWAY. CONFIRMED SELF-BUYS ONLY.</small>
-              </div>
-              <button type="button" aria-label="Close Stock Token calculation dialog" onClick={closeHolderStockDialog}>
-                <X size={24} weight="bold" />
-              </button>
-            </div>
-            <p id="holder-stock-dialog-description" className="visually-hidden">
-              Verified Stock Token purchase-cost calculation for self-directed trades through the
-              current canonical 99/1 Gateway since its activation block.
-            </p>
-
-            <div className="holder-stock-ca-binding">
-              <span>CANONICAL OFFICIAL CA</span>
-              <code>{officialTokenAddress || "PENDING"}</code>
-            </div>
-
-            {!holderStockBindingReady ? (
-              <div className="holder-stock-proof-state holder-stock-proof-pending">
-                <strong>{officialTokenAddress ? "MARKET BINDING PENDING" : "OFFICIAL CA PENDING"}</strong>
-                <p>
-                  The calculation starts only after the official CA, canonical Gateway, activation
-                  block, and QQQ settlement route are verifiably bound. No placeholder dollar value
-                  is shown.
-                </p>
-              </div>
-            ) : holderStockProof.status === "activation_pending" ? (
-              <div className="holder-stock-proof-state holder-stock-proof-pending" role="status" aria-live="polite">
-                <strong>ACTIVATION CONFIRMING</strong>
-                <p>
-                  The official CA and Gateway are bound, but the activation block has not reached
-                  the required confirmation depth. No zero or estimated total is displayed.
-                </p>
-              </div>
-            ) : ["pending", "idle", "loading"].includes(holderStockProof.status) ? (
-              <div className="holder-stock-proof-state holder-stock-proof-loading" role="status" aria-live="polite">
-                <strong>READING CONFIRMED TRADES…</strong>
-                <p>
-                  Matching self-directed SplitBuy events to the canonical USDG → QQQ pool.
-                </p>
-              </div>
-            ) : holderStockProof.status === "error" ? (
-              <div className="holder-stock-proof-state holder-stock-proof-error" role="alert">
-                <strong>CALCULATION UNAVAILABLE</strong>
-                <p>
-                  The canonical logs could not be completely verified. No partial total or estimate
-                  is displayed.
-                </p>
-                <button type="button" onClick={holderStockProof.refresh}>
-                  <ArrowClockwise size={18} weight="bold" /> RETRY VERIFICATION
-                </button>
-              </div>
-            ) : (
-              <>
-                <div
-                  className={`holder-stock-proof-result${holderStockProof.status === "stale" ? " is-stale" : ""}`}
-                  role="status"
-                  aria-live="polite"
-                >
-                  <span>CURRENT CANONICAL GATEWAY · CONFIRMED USDG CASH LEG</span>
-                  <strong>≈${formatGroupedDecimal(holderStockProof.approximateUsdValue)}</strong>
-                  <small>
-                    {holderStockProof.status === "empty"
-                      ? "VERIFIED ZERO · NO CONFIRMED SELF-DIRECTED SPLITBUY EVENTS"
-                      : `SINCE ACTIVATION BLOCK ${holderStockProof.activatedBlock} · NOMINAL $1 PER USDG`}
-                  </small>
-                </div>
-
-                <div className="holder-stock-proof-grid">
-                  <div><span>SELF-BUY EVENTS</span><b>{holderStockProof.selfBuyCount.toLocaleString("en-US")}</b></div>
-                  <div><span>UNIQUE BUYERS</span><b>{holderStockProof.uniqueBuyerCount.toLocaleString("en-US")}</b></div>
-                  <div><span>USDG SPENT</span><b>{formatGroupedDecimal(holderStockProof.usdgSpent)} USDG</b></div>
-                  <div><span>QQQ RECEIVED</span><b>{formatGroupedDecimal(holderStockProof.qqqAmount)} QQQ</b></div>
-                </div>
-
-                <div className="holder-stock-proof-formula">
-                  <span>VERIFIED FORMULA</span>
-                  <code>Σ USDG→QQQ amount0 · payer = recipient · −amount1 = SplitBuy.stockAmountOut</code>
-                  <p>
-                    Direct CA buys, sells, transfers, airdrops, and unmatched swaps are excluded
-                    because they did not prove a Stock Token leg. A future Gateway replacement
-                    starts a new activation epoch; this is not an all-version historical total.
-                  </p>
-                </div>
-
-                <dl className="holder-stock-proof-meta">
-                  <div><dt>BLOCK RANGE</dt><dd>{holderStockProof.activatedBlock} → {holderStockProof.asOfBlock}</dd></div>
-                  <div><dt>CHECKED</dt><dd>{formatProofTimestamp(holderStockProof.updatedAt)}</dd></div>
-                  <div><dt>STATE</dt><dd>{holderStockProof.status === "stale" ? "STALE · LAST VERIFIED TOTAL" : "CONFIRMED"}</dd></div>
-                </dl>
-
-                <div className="holder-stock-proof-actions">
-                  <button type="button" onClick={holderStockProof.refresh}>
-                    <ArrowClockwise size={18} weight="bold" /> REFRESH
-                  </button>
-                  <a href={`${CHAIN.blockExplorerUrls[0]}/token/${officialTokenAddress}`} target="_blank" rel="noreferrer">
-                    OFFICIAL CA <ArrowRight size={17} weight="bold" />
-                  </a>
-                  <a href={`${CHAIN.blockExplorerUrls[0]}/address/${holderStockProof.gatewayAddress}?tab=logs`} target="_blank" rel="noreferrer">
-                    GATEWAY LOGS <ArrowRight size={17} weight="bold" />
-                  </a>
-                  <a href={`${CHAIN.blockExplorerUrls[0]}/address/${holderStockProof.settlementPoolAddress}?tab=logs`} target="_blank" rel="noreferrer">
-                    USDG/QQQ POOL <ArrowRight size={17} weight="bold" />
-                  </a>
-                </div>
-
-                {holderStockProof.status === "stale" ? (
-                  <p className="holder-stock-proof-warning" role="status">
-                    {holderStockProof.error
-                      ? "The last complete total is retained because the latest refresh failed."
-                      : "This proof has expired. Refresh it before treating the total as current."}
-                  </p>
-                ) : null}
-              </>
-            )}
-          </section>
-        </div>
-      )}
 
       {isBuySheetOpen && (
         <div className="buy-dialog-backdrop" onMouseDown={(event) => {
@@ -1383,6 +1148,7 @@ function HomePage() {
         <div className="footer-slogan"><span><b>99%</b> APE.</span><span><b>1%</b> ADULT.</span></div>
         <nav className="footer-links" aria-label="Project information">
           <a className="footer-proof" href="/flow">HOW IT WORKS</a>
+          <a className="footer-proof" href="/sandbox">RUN SANDBOX</a>
           <a className="footer-proof" href="/code">VERIFY THE CODE</a>
           <a className="footer-proof foundation-proof-link" href="/deploy">
             {MARKET.releaseManifestActive
@@ -1402,6 +1168,9 @@ export function App() {
   }
   if (path === "/flow") {
     return <Suspense fallback={<RouteFallback />}><FlowPage /></Suspense>;
+  }
+  if (path === "/sandbox") {
+    return <Suspense fallback={<RouteFallback />}><SandboxPage /></Suspense>;
   }
   if (path === "/code" || path === "/proof") {
     return <Suspense fallback={<RouteFallback />}><CodePage /></Suspense>;
